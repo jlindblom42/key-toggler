@@ -119,6 +119,8 @@ struct AppState {
     NOTIFYICONDATAW trayIconData{};
     bool trayIconVisible = false;
     bool minimizeToTrayEnabled = true;
+    HICON appIconLarge{};
+    HICON appIconSmall{};
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -146,6 +148,7 @@ void UpdateOverlay();
 void RepositionOverlayWindow();
 void UpdateRemoveButtonEnabled();
 void SaveConfiguration();
+HICON CreateKtIcon(int sizePx);
 
 std::wstring GetConfigPath() {
     wchar_t appDataPath[MAX_PATH]{};
@@ -259,7 +262,16 @@ void ShowTrayIcon() {
     icon.uID = kTrayIconId;
     icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     icon.uCallbackMessage = kTrayIconCallbackMessage;
-    icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    icon.hIcon = nullptr;
+    if (gState.appIconSmall != nullptr) {
+        icon.hIcon = CopyIcon(gState.appIconSmall);
+    }
+    if (icon.hIcon == nullptr && gState.appIconLarge != nullptr) {
+        icon.hIcon = CopyIcon(gState.appIconLarge);
+    }
+    if (icon.hIcon == nullptr) {
+        icon.hIcon = CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
+    }
     lstrcpynW(icon.szTip, L"Key Toggler", static_cast<int>(std::size(icon.szTip)));
 
     if (Shell_NotifyIconW(NIM_ADD, &icon)) {
@@ -268,6 +280,98 @@ void ShowTrayIcon() {
     } else if (icon.hIcon != nullptr) {
         DestroyIcon(icon.hIcon);
     }
+}
+
+HICON CreateKtIcon(int sizePx) {
+    if (sizePx <= 0) {
+        return nullptr;
+    }
+
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = sizePx;
+    bi.bV5Height = -sizePx;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr) {
+        return nullptr;
+    }
+
+    void* pixels = nullptr;
+    HBITMAP colorBitmap = CreateDIBSection(screenDc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &pixels, nullptr, 0);
+    ReleaseDC(nullptr, screenDc);
+    if (colorBitmap == nullptr) {
+        return nullptr;
+    }
+
+    HDC memDc = CreateCompatibleDC(nullptr);
+    if (memDc == nullptr) {
+        DeleteObject(colorBitmap);
+        return nullptr;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memDc, colorBitmap);
+    RECT fullRect{0, 0, sizePx, sizePx};
+    HBRUSH backgroundBrush = CreateSolidBrush(RGB(28, 56, 125));
+    FillRect(memDc, &fullRect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    SetBkMode(memDc, TRANSPARENT);
+    SetTextColor(memDc, RGB(244, 244, 245));
+
+    const int fontHeight = -MulDiv(std::max(9, sizePx * 10 / 16), GetDeviceCaps(memDc, LOGPIXELSY), 72);
+    HFONT textFont = CreateFontW(fontHeight,
+                                 0,
+                                 0,
+                                 0,
+                                 FW_BOLD,
+                                 FALSE,
+                                 FALSE,
+                                 FALSE,
+                                 DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS,
+                                 CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH | FF_DONTCARE,
+                                 L"Segoe UI");
+
+    HGDIOBJ oldFont = nullptr;
+    if (textFont != nullptr) {
+        oldFont = SelectObject(memDc, textFont);
+    }
+
+    RECT textRect{0, 0, sizePx, sizePx};
+    DrawTextW(memDc, L"KT", -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    if (oldFont != nullptr) {
+        SelectObject(memDc, oldFont);
+    }
+    if (textFont != nullptr) {
+        DeleteObject(textFont);
+    }
+
+    SelectObject(memDc, oldBitmap);
+    DeleteDC(memDc);
+
+    HBITMAP maskBitmap = CreateBitmap(sizePx, sizePx, 1, 1, nullptr);
+    ICONINFO iconInfo{};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmMask = maskBitmap;
+    iconInfo.hbmColor = colorBitmap;
+
+    HICON icon = CreateIconIndirect(&iconInfo);
+    if (maskBitmap != nullptr) {
+        DeleteObject(maskBitmap);
+    }
+    DeleteObject(colorBitmap);
+    return icon;
 }
 
 void HideTrayIcon() {
@@ -1146,7 +1250,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                WS_VISIBLE | WS_CHILD,
                                                20,
                                                140,
-                                               520,
+                                               345,
                                                28,
                                                hwnd,
                                                reinterpret_cast<HMENU>(IDC_STATUS_LABEL),
@@ -1472,6 +1576,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DeleteObject(gState.controlBrush);
                 gState.controlBrush = nullptr;
             }
+            if (gState.appIconLarge != nullptr) {
+                DestroyIcon(gState.appIconLarge);
+                gState.appIconLarge = nullptr;
+            }
+            if (gState.appIconSmall != nullptr) {
+                DestroyIcon(gState.appIconSmall);
+                gState.appIconSmall = nullptr;
+            }
             PostQuitMessage(0);
             return 0;
 
@@ -1538,27 +1650,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     gState.instance = hInstance;
+    gState.appIconLarge = CreateKtIcon(GetSystemMetrics(SM_CXICON));
+    gState.appIconSmall = CreateKtIcon(GetSystemMetrics(SM_CXSMICON));
+    if (gState.appIconSmall == nullptr && gState.appIconLarge != nullptr) {
+        gState.appIconSmall = CopyIcon(gState.appIconLarge);
+    }
     LoadConfiguration();
 
-    WNDCLASSW wc{};
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = kWindowClassName;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = (gState.appIconLarge != nullptr) ? gState.appIconLarge : LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIconSm = (gState.appIconSmall != nullptr) ? gState.appIconSmall : LoadIcon(nullptr, IDI_APPLICATION);
 
-    if (!RegisterClassW(&wc)) {
+    if (!RegisterClassExW(&wc)) {
         MessageBoxW(nullptr, L"Failed to register window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    WNDCLASSW overlayWc{};
+    WNDCLASSEXW overlayWc{};
+    overlayWc.cbSize = sizeof(overlayWc);
     overlayWc.lpfnWndProc = OverlayWindowProc;
     overlayWc.hInstance = hInstance;
     overlayWc.lpszClassName = kOverlayWindowClassName;
     overlayWc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     overlayWc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
 
-    if (!RegisterClassW(&overlayWc)) {
+    if (!RegisterClassExW(&overlayWc)) {
         MessageBoxW(nullptr, L"Failed to register overlay window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
