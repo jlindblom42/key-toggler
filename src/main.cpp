@@ -38,6 +38,7 @@ struct AppState {
     UINT targetVk = 'T';
     UINT doubleTapMs = kDefaultDoubleTapMs;
     bool keyLatched = false;
+    bool releaseLatchedOnNextPhysicalUp = false;
     bool suppressPhysicalUntilUp = false;
     bool physicalKeyIsDown = false;
     std::chrono::steady_clock::time_point lastPhysicalDown{};
@@ -158,6 +159,7 @@ void ApplyConfiguredKey() {
     gState.targetVk = parsed;
     gState.doubleTapMs = parsedDoubleTapMs;
     gState.hasFirstTap = false;
+    gState.releaseLatchedOnNextPhysicalUp = false;
     gState.suppressPhysicalUntilUp = false;
     gState.physicalKeyIsDown = false;
     UpdateStatus();
@@ -194,17 +196,27 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
 
     if (gState.keyLatched) {
         if (isDown) {
-            SendVirtualKey(gState.targetVk, false);
-            StopRepeatTimer();
-            gState.keyLatched = false;
-            gState.suppressPhysicalUntilUp = true;
-            gState.physicalKeyIsDown = true;
-            gState.hasFirstTap = false;
-            UpdateStatus();
+            if (!gState.physicalKeyIsDown) {
+                gState.physicalKeyIsDown = true;
+                gState.releaseLatchedOnNextPhysicalUp = true;
+            }
             return 1;
         }
 
-        return CallNextHookEx(nullptr, code, wParam, lParam);
+        if (isUp) {
+            gState.physicalKeyIsDown = false;
+            if (gState.releaseLatchedOnNextPhysicalUp) {
+                SendVirtualKey(gState.targetVk, false);
+                StopRepeatTimer();
+                gState.keyLatched = false;
+                gState.releaseLatchedOnNextPhysicalUp = false;
+                gState.hasFirstTap = false;
+                UpdateStatus();
+            }
+            return 1;
+        }
+
+        return 1;
     }
 
     if (isUp) {
@@ -226,6 +238,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
                 StartRepeatTimer();
                 gState.keyLatched = true;
                 gState.hasFirstTap = false;
+                gState.releaseLatchedOnNextPhysicalUp = false;
                 gState.suppressPhysicalUntilUp = true;
                 UpdateStatus();
                 return 1;
