@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <array>
@@ -85,6 +86,9 @@ AppState gState;
 constexpr COLORREF kDarkBackgroundColor = RGB(24, 24, 27);
 constexpr COLORREF kDarkSurfaceColor = RGB(39, 39, 42);
 constexpr COLORREF kDarkTextColor = RGB(244, 244, 245);
+constexpr COLORREF kDarkButtonColor = RGB(63, 63, 70);
+constexpr COLORREF kDarkButtonHoverColor = RGB(82, 82, 91);
+constexpr COLORREF kDarkButtonDisabledColor = RGB(51, 51, 56);
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -598,6 +602,11 @@ void ApplyUiFont(HWND hwnd) {
     }
 }
 
+void TryEnableDarkTitleBar(HWND hwnd) {
+    const BOOL enableDarkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enableDarkMode, sizeof(enableDarkMode));
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -615,7 +624,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           WS_VISIBLE | WS_CHILD,
                           20,
                           20,
-                          250,
+                          350,
                           30,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_KEY_LABEL),
@@ -624,8 +633,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             gState.addButton = CreateWindowW(L"BUTTON",
                                              L"Add New Key",
-                                             WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                                             270,
+                                             WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                                             380,
                                              18,
                                              150,
                                              34,
@@ -684,7 +693,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             gState.removeButton = CreateWindowW(L"BUTTON",
                                                 L"Remove Selected",
-                                                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                                                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                                                 20,
                                                 316,
                                                 170,
@@ -702,11 +711,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           20,
                           360,
                           700,
-                          64,
+                          88,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_TIPS_LABEL),
                           gState.instance,
                           nullptr);
+
+            TryEnableDarkTitleBar(hwnd);
 
             HWND currentControl = GetWindow(hwnd, GW_CHILD);
             while (currentControl != nullptr) {
@@ -717,6 +728,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetAwaitingNewBinding(false);
             UpdateStatus();
             return 0;
+        }
+
+        case WM_DRAWITEM: {
+            const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+            if (drawItem == nullptr ||
+                (drawItem->CtlID != IDC_ADD_BUTTON && drawItem->CtlID != IDC_REMOVE_BUTTON)) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+
+            COLORREF fillColor = kDarkButtonColor;
+            if ((drawItem->itemState & ODS_DISABLED) != 0) {
+                fillColor = kDarkButtonDisabledColor;
+            } else if ((drawItem->itemState & ODS_HOTLIGHT) != 0 || (drawItem->itemState & ODS_SELECTED) != 0) {
+                fillColor = kDarkButtonHoverColor;
+            }
+
+            HBRUSH buttonBrush = CreateSolidBrush(fillColor);
+            FillRect(drawItem->hDC, &drawItem->rcItem, buttonBrush);
+            DeleteObject(buttonBrush);
+
+            SetBkMode(drawItem->hDC, TRANSPARENT);
+            SetTextColor(drawItem->hDC, kDarkTextColor);
+            if (gState.uiFont != nullptr) {
+                SelectObject(drawItem->hDC, gState.uiFont);
+            }
+
+            std::array<wchar_t, 64> caption{};
+            GetWindowTextW(drawItem->hwndItem, caption.data(), static_cast<int>(caption.size()));
+            RECT textRect = drawItem->rcItem;
+            DrawTextW(drawItem->hDC, caption.data(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if ((drawItem->itemState & ODS_FOCUS) != 0) {
+                RECT focusRect = drawItem->rcItem;
+                InflateRect(&focusRect, -3, -3);
+                DrawFocusRect(drawItem->hDC, &focusRect);
+            }
+            return TRUE;
         }
 
         case WM_COMMAND: {
@@ -753,8 +801,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CTLCOLORBTN: {
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetTextColor(dc, kDarkTextColor);
-            SetBkColor(dc, kDarkSurfaceColor);
-            return reinterpret_cast<LRESULT>(gState.controlBrush != nullptr ? gState.controlBrush : GetStockObject(BLACK_BRUSH));
+            const COLORREF backgroundColor = (msg == WM_CTLCOLORSTATIC) ? kDarkBackgroundColor : kDarkSurfaceColor;
+            SetBkColor(dc, backgroundColor);
+            HBRUSH brush = (msg == WM_CTLCOLORSTATIC) ? gState.backgroundBrush : gState.controlBrush;
+            return reinterpret_cast<LRESULT>(brush != nullptr ? brush : GetStockObject(BLACK_BRUSH));
         }
 
         case WM_ERASEBKGND: {
@@ -827,7 +877,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     760,
-                                    500,
+                                    560,
                                     nullptr,
                                     nullptr,
                                     hInstance,
