@@ -4,13 +4,13 @@ A lightweight Windows GUI app that latches configured keys or mouse buttons as "
 
 ## Behavior
 
-- Configure a trigger input (default text: `T`).
 - Supported typed names include keyboard keys like `SHIFT`, `ALT`, `CTRL`, arrows, and mouse buttons like `MOUSE1`-`MOUSE5`.
-- You can click **Detect (5s)** and press a key/button once within 5 seconds to fill the input box.
-- Click **Add New Key** to add that key/button with the configured double-tap window.
+- Click **Add New Key** and then press a key/button once within 5 seconds to capture it.
+- While waiting for input, the **Add New Key** button is disabled and shows the remaining countdown.
 - Each configured key/button behaves independently:
   - Double tap it quickly (within its configured window, default 300 ms) to latch it down.
   - Tap or hold that same key/button once to release only that key/button latch.
+- Configured bindings in the list show `[ON]` when latched and `[OFF]` when idle.
 - Re-adding an existing key/button updates its timing.
 
 ## Build locally (Windows)

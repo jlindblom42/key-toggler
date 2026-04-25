@@ -30,9 +30,8 @@ enum ControlId : int {
     IDC_TIPS_LABEL = 1005,
     IDC_DOUBLE_TAP_LABEL = 1006,
     IDC_DOUBLE_TAP_EDIT = 1007,
-    IDC_DETECT_BUTTON = 1008,
-    IDC_BINDINGS_LIST = 1009,
-    IDC_REMOVE_BUTTON = 1010,
+    IDC_BINDINGS_LIST = 1008,
+    IDC_REMOVE_BUTTON = 1009,
 };
 
 enum class InputKind {
@@ -65,7 +64,7 @@ struct AppState {
     HWND keyEdit{};
     HWND doubleTapEdit{};
     HWND statusLabel{};
-    HWND detectButton{};
+    HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
 
@@ -158,7 +157,8 @@ void UpdateBindingsLabel() {
     SendMessageW(gState.bindingsList, LB_RESETCONTENT, 0, 0);
     for (const auto& binding : gState.bindings) {
         std::wstring line =
-            InputToDisplay(binding.target) + L" (" + std::to_wstring(binding.doubleTapMs) + L" ms)";
+            std::wstring(binding.keyLatched ? L"[ON] " : L"[OFF] ") + InputToDisplay(binding.target) + L" (" +
+            std::to_wstring(binding.doubleTapMs) + L" ms)";
         SendMessageW(gState.bindingsList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
     }
 
@@ -234,8 +234,11 @@ void StopDetectMode(bool restoreButtonText) {
         KillTimer(gState.window, kDetectTimerId);
     }
 
-    if (restoreButtonText && gState.detectButton != nullptr) {
-        SetWindowTextW(gState.detectButton, L"Detect (5s)");
+    if (restoreButtonText && gState.addButton != nullptr) {
+        SetWindowTextW(gState.addButton, L"Add New Key");
+    }
+    if (gState.addButton != nullptr) {
+        EnableWindow(gState.addButton, TRUE);
     }
 }
 
@@ -243,7 +246,6 @@ void StopDetectMode(bool restoreButtonText) {
 void SetAwaitingNewBinding(bool awaiting) {
     gState.isAwaitingNewBinding = awaiting;
     ShowWindow(gState.keyEdit, awaiting ? SW_SHOW : SW_HIDE);
-    ShowWindow(gState.detectButton, awaiting ? SW_SHOW : SW_HIDE);
     if (!awaiting) {
         SetWindowTextW(gState.keyEdit, L"");
     }
@@ -337,26 +339,20 @@ void RemoveSelectedBinding() {
 void AddConfiguredInput() {
     if (gState.isAwaitingNewBinding) {
         MessageBoxW(gState.window,
-                    L"Click Detect and press the key/button to finish adding this binding.",
+                    L"Press the key/button you want to bind.",
                     L"Waiting for detection",
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
 
     SetAwaitingNewBinding(true);
-}
-
-void BeginDetectMode() {
-    if (!gState.isAwaitingNewBinding) {
-        MessageBoxW(gState.window, L"Press Add New Key first.", L"Add key first", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
     UINT parsedDoubleTapMs = 0;
     if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
         MessageBoxW(gState.window,
                     L"Please enter a valid double-tap window in milliseconds (50-2000) before detecting.",
                     L"Invalid double-tap window",
                     MB_OK | MB_ICONWARNING);
+        SetAwaitingNewBinding(false);
         return;
     }
 
@@ -364,8 +360,8 @@ void BeginDetectMode() {
     gState.isDetectingInput = true;
     gState.detectSecondsRemaining = kDetectTimeoutSeconds;
     SetTimer(gState.window, kDetectTimerId, kDetectCountdownMs, nullptr);
-
-    SetWindowTextW(gState.detectButton, L"Press input... (5)");
+    EnableWindow(gState.addButton, FALSE);
+    SetWindowTextW(gState.addButton, L"Press input... (5)");
     SetFocus(gState.window);
 }
 
@@ -613,22 +609,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           gState.instance,
                           nullptr);
 
-            CreateWindowW(L"BUTTON",
-                          L"Add New Key",
-                          WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                          240,
-                          18,
-                          110,
-                          24,
-                          hwnd,
-                          reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
-                          gState.instance,
-                          nullptr);
+            gState.addButton = CreateWindowW(L"BUTTON",
+                                             L"Add New Key",
+                                             WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                                             240,
+                                             18,
+                                             120,
+                                             24,
+                                             hwnd,
+                                             reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
+                                             gState.instance,
+                                             nullptr);
 
             gState.keyEdit = CreateWindowW(L"EDIT",
                                            L"",
                                            WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
-                                           360,
+                                           370,
                                            18,
                                            190,
                                            24,
@@ -636,18 +632,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                            reinterpret_cast<HMENU>(IDC_KEY_EDIT),
                                            gState.instance,
                                            nullptr);
-
-            gState.detectButton = CreateWindowW(L"BUTTON",
-                                                L"Detect (5s)",
-                                                WS_CHILD | BS_PUSHBUTTON,
-                                                560,
-                                                18,
-                                                100,
-                                                24,
-                                                hwnd,
-                                                reinterpret_cast<HMENU>(IDC_DETECT_BUTTON),
-                                                gState.instance,
-                                                nullptr);
 
             CreateWindowW(L"STATIC",
                           L"Double-tap window (ms):",
@@ -712,7 +696,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"STATIC",
                           L"Behavior: each configured key/button toggles independently; double tap to latch."
                           L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
-                          L"Press Add New Key, then Detect to capture one input. Repeat Add New Key for each extra binding.",
+                          L"Press Add New Key and then press one key/button within 5 seconds. Repeat Add New Key for each extra binding.",
                           WS_VISIBLE | WS_CHILD,
                           20,
                           292,
@@ -731,8 +715,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND: {
             if (LOWORD(wParam) == IDC_ADD_BUTTON) {
                 AddConfiguredInput();
-            } else if (LOWORD(wParam) == IDC_DETECT_BUTTON) {
-                BeginDetectMode();
             } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
                 RemoveSelectedBinding();
             }
@@ -772,9 +754,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 --gState.detectSecondsRemaining;
                 if (gState.detectSecondsRemaining <= 0) {
                     StopDetectMode(true);
+                    SetAwaitingNewBinding(false);
                 } else {
                     std::wstring text = L"Press input... (" + std::to_wstring(gState.detectSecondsRemaining) + L")";
-                    SetWindowTextW(gState.detectButton, text.c_str());
+                    SetWindowTextW(gState.addButton, text.c_str());
                 }
                 return 0;
             }
