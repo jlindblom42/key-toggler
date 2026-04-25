@@ -11,4 +11,4 @@ add_executable(key_toggler WIN32
 
 target_compile_definitions(key_toggler PRIVATE UNICODE _UNICODE)
 
-target_link_libraries(key_toggler PRIVATE user32 gdi32 dwmapi)
+target_link_libraries(key_toggler PRIVATE user32 gdi32 dwmapi comdlg32)
