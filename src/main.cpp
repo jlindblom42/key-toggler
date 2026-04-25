@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <dwmapi.h>
+#include <commdlg.h>
 
 #include <algorithm>
 #include <array>
@@ -36,6 +37,11 @@ enum ControlId : int {
     IDC_OVERLAY_CHECKBOX = 1010,
     IDC_OVERLAY_FONT_LABEL = 1011,
     IDC_OVERLAY_FONT_EDIT = 1012,
+    IDC_OVERLAY_CORNER_LABEL = 1013,
+    IDC_OVERLAY_CORNER_COMBO = 1014,
+    IDC_OVERLAY_COLOR_BUTTON = 1015,
+    IDC_OVERLAY_MONITOR_LABEL = 1016,
+    IDC_OVERLAY_MONITOR_COMBO = 1017,
 };
 
 enum class InputKind {
@@ -62,6 +68,17 @@ struct ToggleBinding {
     std::chrono::steady_clock::time_point nextRepeatAt{};
 };
 
+enum class OverlayCorner {
+    TopLeft,
+    TopRight,
+};
+
+struct MonitorEntry {
+    HMONITOR handle{};
+    RECT bounds{};
+    std::wstring label{};
+};
+
 struct AppState {
     HINSTANCE instance{};
     HWND window{};
@@ -72,6 +89,9 @@ struct AppState {
     HWND removeButton{};
     HWND overlayCheckbox{};
     HWND overlayFontEdit{};
+    HWND overlayCornerCombo{};
+    HWND overlayColorButton{};
+    HWND overlayMonitorCombo{};
     HWND overlayWindow{};
     HFONT uiFont{};
     HFONT overlayFont{};
@@ -81,6 +101,9 @@ struct AppState {
     bool isAwaitingNewBinding = false;
     bool overlayEnabled = true;
     int overlayFontSizePx = 16;
+    OverlayCorner overlayCorner = OverlayCorner::TopLeft;
+    COLORREF overlayTextColor = RGB(244, 244, 245);
+    std::vector<MonitorEntry> monitors{};
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -105,6 +128,7 @@ constexpr int kMaxOverlayFontSizePx = 48;
 
 void SetOverlayVisible(bool visible);
 void UpdateOverlay();
+void RepositionOverlayWindow();
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -259,9 +283,109 @@ void UpdateOverlay() {
 
     std::wstring text = BuildOverlayText();
     SetWindowTextW(gState.overlayWindow, text.c_str());
+    RepositionOverlayWindow();
     if (gState.overlayEnabled) {
         SetOverlayVisible(true);
     }
+    InvalidateRect(gState.overlayWindow, nullptr, TRUE);
+}
+
+BOOL CALLBACK CollectMonitorProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) {
+    auto* entries = reinterpret_cast<std::vector<MonitorEntry>*>(lParam);
+    if (entries == nullptr) {
+        return FALSE;
+    }
+
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(hMonitor, &info)) {
+        return TRUE;
+    }
+
+    MonitorEntry entry{};
+    entry.handle = hMonitor;
+    entry.bounds = info.rcMonitor;
+    entry.label = info.szDevice;
+    if ((info.dwFlags & MONITORINFOF_PRIMARY) != 0) {
+        entry.label += L" (Primary)";
+    }
+    entries->push_back(entry);
+    return TRUE;
+}
+
+void RefreshMonitorList() {
+    LRESULT previousSelection = CB_ERR;
+    if (gState.overlayMonitorCombo != nullptr) {
+        previousSelection = SendMessageW(gState.overlayMonitorCombo, CB_GETCURSEL, 0, 0);
+    }
+
+    gState.monitors.clear();
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorProc, reinterpret_cast<LPARAM>(&gState.monitors));
+
+    if (gState.overlayMonitorCombo == nullptr) {
+        return;
+    }
+
+    SendMessageW(gState.overlayMonitorCombo, CB_RESETCONTENT, 0, 0);
+    for (const auto& monitor : gState.monitors) {
+        SendMessageW(gState.overlayMonitorCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(monitor.label.c_str()));
+    }
+
+    if (!gState.monitors.empty()) {
+        const LRESULT selectionToApply =
+            (previousSelection >= 0 && static_cast<size_t>(previousSelection) < gState.monitors.size()) ? previousSelection : 0;
+        SendMessageW(gState.overlayMonitorCombo, CB_SETCURSEL, selectionToApply, 0);
+    }
+}
+
+RECT GetSelectedMonitorBounds() {
+    if (gState.monitors.empty()) {
+        RECT fallback{0, 0, 1920, 1080};
+        return fallback;
+    }
+
+    LRESULT selected = CB_ERR;
+    if (gState.overlayMonitorCombo != nullptr) {
+        selected = SendMessageW(gState.overlayMonitorCombo, CB_GETCURSEL, 0, 0);
+    }
+    if (selected == CB_ERR || selected < 0 || static_cast<size_t>(selected) >= gState.monitors.size()) {
+        return gState.monitors.front().bounds;
+    }
+    return gState.monitors[static_cast<size_t>(selected)].bounds;
+}
+
+void RepositionOverlayWindow() {
+    if (gState.overlayWindow == nullptr) {
+        return;
+    }
+
+    constexpr int kOverlayWidth = 280;
+    constexpr int kOverlayHeight = 240;
+    constexpr int kOverlayMargin = 10;
+
+    RECT bounds = GetSelectedMonitorBounds();
+    const int x = (gState.overlayCorner == OverlayCorner::TopLeft)
+                      ? (bounds.left + kOverlayMargin)
+                      : (bounds.right - kOverlayWidth - kOverlayMargin);
+    const int y = bounds.top + kOverlayMargin;
+
+    SetWindowPos(
+        gState.overlayWindow, HWND_TOPMOST, x, y, kOverlayWidth, kOverlayHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void PickOverlayColor() {
+    COLORREF customColors[16]{};
+    CHOOSECOLORW chooser{};
+    chooser.lStructSize = sizeof(chooser);
+    chooser.hwndOwner = gState.window;
+    chooser.rgbResult = gState.overlayTextColor;
+    chooser.lpCustColors = customColors;
+    chooser.Flags = CC_RGBINIT | CC_FULLOPEN;
+    if (!ChooseColorW(&chooser)) {
+        return;
+    }
+
+    gState.overlayTextColor = chooser.rgbResult;
     InvalidateRect(gState.overlayWindow, nullptr, TRUE);
 }
 
@@ -731,7 +855,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             DeleteObject(background);
 
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, kDarkTextColor);
+            SetTextColor(dc, gState.overlayTextColor);
             if (gState.overlayFont != nullptr) {
                 SelectObject(dc, gState.overlayFont);
             } else if (gState.uiFont != nullptr) {
@@ -853,11 +977,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 nullptr);
 
             gState.overlayCheckbox = CreateWindowW(L"BUTTON",
-                                                   L"Show top-left overlay",
+                                                   L"Show overlay",
                                                    WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-                                                   220,
+                                                   20,
                                                    318,
-                                                   240,
+                                                   170,
                                                    28,
                                                    hwnd,
                                                    reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
@@ -868,9 +992,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"STATIC",
                           L"Overlay font size:",
                           WS_VISIBLE | WS_CHILD,
-                          480,
+                          220,
                           318,
-                          150,
+                          120,
                           28,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_OVERLAY_FONT_LABEL),
@@ -880,7 +1004,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.overlayFontEdit = CreateWindowW(L"EDIT",
                                                    L"16",
                                                    WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                                                   635,
+                                                   345,
                                                    316,
                                                    45,
                                                    30,
@@ -890,12 +1014,76 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                    nullptr);
 
             CreateWindowW(L"STATIC",
+                          L"Overlay corner:",
+                          WS_VISIBLE | WS_CHILD,
+                          420,
+                          318,
+                          110,
+                          28,
+                          hwnd,
+                          reinterpret_cast<HMENU>(IDC_OVERLAY_CORNER_LABEL),
+                          gState.instance,
+                          nullptr);
+
+            gState.overlayCornerCombo = CreateWindowW(L"COMBOBOX",
+                                                      L"",
+                                                      WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
+                                                      535,
+                                                      316,
+                                                      115,
+                                                      220,
+                                                      hwnd,
+                                                      reinterpret_cast<HMENU>(IDC_OVERLAY_CORNER_COMBO),
+                                                      gState.instance,
+                                                      nullptr);
+            SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-left"));
+            SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-right"));
+            SendMessageW(gState.overlayCornerCombo, CB_SETCURSEL, 0, 0);
+
+            gState.overlayColorButton = CreateWindowW(L"BUTTON",
+                                                      L"Overlay Color...",
+                                                      WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                                                      655,
+                                                      316,
+                                                      90,
+                                                      30,
+                                                      hwnd,
+                                                      reinterpret_cast<HMENU>(IDC_OVERLAY_COLOR_BUTTON),
+                                                      gState.instance,
+                                                      nullptr);
+
+            CreateWindowW(L"STATIC",
+                          L"Overlay monitor:",
+                          WS_VISIBLE | WS_CHILD,
+                          20,
+                          356,
+                          120,
+                          28,
+                          hwnd,
+                          reinterpret_cast<HMENU>(IDC_OVERLAY_MONITOR_LABEL),
+                          gState.instance,
+                          nullptr);
+
+            gState.overlayMonitorCombo = CreateWindowW(L"COMBOBOX",
+                                                       L"",
+                                                       WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
+                                                       145,
+                                                       354,
+                                                       340,
+                                                       220,
+                                                       hwnd,
+                                                       reinterpret_cast<HMENU>(IDC_OVERLAY_MONITOR_COMBO),
+                                                       gState.instance,
+                                                       nullptr);
+            RefreshMonitorList();
+
+            CreateWindowW(L"STATIC",
                           L"Behavior: each configured key/button toggles independently; double tap to latch."
                           L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
                           L"Press Add New Key and then press one key/button within 5 seconds. Repeat Add New Key for each extra binding.",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          360,
+                          392,
                           700,
                           88,
                           hwnd,
@@ -940,7 +1128,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_DRAWITEM: {
             const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
             if (drawItem == nullptr ||
-                (drawItem->CtlID != IDC_ADD_BUTTON && drawItem->CtlID != IDC_REMOVE_BUTTON)) {
+                (drawItem->CtlID != IDC_ADD_BUTTON && drawItem->CtlID != IDC_REMOVE_BUTTON &&
+                 drawItem->CtlID != IDC_OVERLAY_COLOR_BUTTON)) {
                 return DefWindowProcW(hwnd, msg, wParam, lParam);
             }
 
@@ -984,6 +1173,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetOverlayVisible(gState.overlayEnabled);
             } else if (LOWORD(wParam) == IDC_OVERLAY_FONT_EDIT && HIWORD(wParam) == EN_CHANGE) {
                 ApplyOverlayFontSizeFromUi();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_COLOR_BUTTON) {
+                PickOverlayColor();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_CORNER_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                LRESULT selected = SendMessageW(gState.overlayCornerCombo, CB_GETCURSEL, 0, 0);
+                gState.overlayCorner = (selected == 1) ? OverlayCorner::TopRight : OverlayCorner::TopLeft;
+                RepositionOverlayWindow();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_DROPDOWN) {
+                RefreshMonitorList();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                RepositionOverlayWindow();
             }
             return 0;
         }
@@ -1109,7 +1308,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     760,
-                                    560,
+                                    610,
                                     nullptr,
                                     nullptr,
                                     hInstance,
