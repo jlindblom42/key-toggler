@@ -31,3 +31,9 @@ This repository includes a Windows runner workflow at:
 - `.github/workflows/build-windows.yml`
 
 It builds the project and uploads `key_toggler.exe` as an artifact named `key-toggler-windows-exe`.
+
+
+## Versioning and releases
+
+- Semantic versioning is tracked in `VERSION` (starting at `1.0.0`).
+- On every push to `main` (including merged PRs), GitHub Actions increments the patch version, commits it, builds `key_toggler.exe`, and publishes a GitHub Release with the executable attached.
