@@ -33,6 +33,7 @@ enum ControlId : int {
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_BINDINGS_LIST = 1008,
     IDC_REMOVE_BUTTON = 1009,
+    IDC_OVERLAY_CHECKBOX = 1010,
     IDC_OVERLAY_FONT_LABEL = 1011,
     IDC_OVERLAY_FONT_EDIT = 1012,
     IDC_OVERLAY_CORNER_LABEL = 1013,
@@ -40,6 +41,7 @@ enum ControlId : int {
     IDC_OVERLAY_COLOR_BUTTON = 1015,
     IDC_OVERLAY_MONITOR_LABEL = 1016,
     IDC_OVERLAY_MONITOR_COMBO = 1017,
+    IDC_OVERLAY_COLOR_PREVIEW = 1018,
 };
 
 enum class InputKind {
@@ -85,8 +87,10 @@ struct AppState {
     HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
+    HWND overlayCheckbox{};
     HWND overlayFontEdit{};
     HWND overlayCornerCombo{};
+    HWND overlayColorPreview{};
     HWND overlayColorButton{};
     HWND overlayMonitorCombo{};
     HWND overlayWindow{};
@@ -383,6 +387,9 @@ void PickOverlayColor() {
     }
 
     gState.overlayTextColor = chooser.rgbResult;
+    if (gState.overlayColorPreview != nullptr) {
+        InvalidateRect(gState.overlayColorPreview, nullptr, TRUE);
+    }
     InvalidateRect(gState.overlayWindow, nullptr, TRUE);
 }
 
@@ -985,11 +992,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           gState.instance,
                           nullptr);
 
+            gState.overlayCheckbox = CreateWindowW(L"BUTTON",
+                                                   L"Enabled",
+                                                   WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                                                   20,
+                                                   390,
+                                                   120,
+                                                   28,
+                                                   hwnd,
+                                                   reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
+                                                   gState.instance,
+                                                   nullptr);
+            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+
             CreateWindowW(L"STATIC",
                           L"Font:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          390,
+                          424,
                           120,
                           28,
                           hwnd,
@@ -1001,7 +1021,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                    L"16",
                                                    WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                                    145,
-                                                   388,
+                                                   422,
                                                    50,
                                                    30,
                                                    hwnd,
@@ -1013,7 +1033,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"px",
                           WS_VISIBLE | WS_CHILD,
                           205,
-                          390,
+                          424,
                           35,
                           28,
                           hwnd,
@@ -1021,11 +1041,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           gState.instance,
                           nullptr);
 
+            gState.overlayColorPreview = CreateWindowW(L"STATIC",
+                                                       L"",
+                                                       WS_VISIBLE | WS_CHILD | SS_OWNERDRAW,
+                                                       245,
+                                                       424,
+                                                       45,
+                                                       28,
+                                                       hwnd,
+                                                       reinterpret_cast<HMENU>(IDC_OVERLAY_COLOR_PREVIEW),
+                                                       gState.instance,
+                                                       nullptr);
+
             CreateWindowW(L"STATIC",
                           L"Location:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          430,
+                          464,
                           120,
                           28,
                           hwnd,
@@ -1037,7 +1069,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       L"",
                                                       WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
                                                       145,
-                                                      428,
+                                                      462,
                                                       140,
                                                       220,
                                                       hwnd,
@@ -1052,7 +1084,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       L"Select Color...",
                                                       WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                                                       300,
-                                                      388,
+                                                      422,
                                                       150,
                                                       30,
                                                       hwnd,
@@ -1064,7 +1096,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Monitor:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          470,
+                          504,
                           120,
                           28,
                           hwnd,
@@ -1076,7 +1108,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                        L"",
                                                        WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
                                                        145,
-                                                       468,
+                                                       502,
                                                        340,
                                                        220,
                                                        hwnd,
@@ -1123,8 +1155,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
             if (drawItem == nullptr ||
                 (drawItem->CtlID != IDC_ADD_BUTTON && drawItem->CtlID != IDC_REMOVE_BUTTON &&
-                 drawItem->CtlID != IDC_OVERLAY_COLOR_BUTTON)) {
+                 drawItem->CtlID != IDC_OVERLAY_COLOR_BUTTON &&
+                 drawItem->CtlID != IDC_OVERLAY_COLOR_PREVIEW)) {
                 return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+
+            if (drawItem->CtlID == IDC_OVERLAY_COLOR_PREVIEW) {
+                HBRUSH swatchBrush = CreateSolidBrush(gState.overlayTextColor);
+                FillRect(drawItem->hDC, &drawItem->rcItem, swatchBrush);
+                DeleteObject(swatchBrush);
+                FrameRect(drawItem->hDC, &drawItem->rcItem, reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+                return TRUE;
             }
 
             COLORREF fillColor = kDarkButtonColor;
@@ -1162,6 +1203,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
                 RemoveSelectedBinding();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_CHECKBOX) {
+                gState.overlayEnabled = (SendMessageW(gState.overlayCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                SetOverlayVisible(gState.overlayEnabled);
             } else if (LOWORD(wParam) == IDC_OVERLAY_FONT_EDIT && HIWORD(wParam) == EN_CHANGE) {
                 ApplyOverlayFontSizeFromUi();
             } else if (LOWORD(wParam) == IDC_OVERLAY_COLOR_BUTTON) {
