@@ -720,8 +720,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                  nullptr);
 
             CreateWindowW(L"STATIC",
-                          L"Behavior: each configured key/button toggles independently; double tap to latch and auto-repeat,"
-                          L" then tap/hold once to release.\nUse Add New Key to append another key, or re-add to update its timing.",
+                          L"Behavior: each configured key/button toggles independently; double tap to latch."
+                          L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
+                          L"Use Add New Key to append another key, or re-add to update its timing.",
                           WS_VISIBLE | WS_CHILD,
                           20,
                           176,
@@ -761,8 +762,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         continue;
                     }
 
-                    hasAnyLatched = true;
-                    if (now >= binding.nextRepeatAt) {
+                hasAnyLatched = true;
+                    if (binding.target.kind == InputKind::Keyboard && now >= binding.nextRepeatAt) {
                         SendInputDownOrUp(binding.target, true);
                         binding.nextRepeatAt = now + std::chrono::milliseconds(kRepeatIntervalMs);
                     }
