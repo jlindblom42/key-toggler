@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <commdlg.h>
+#include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <array>
@@ -24,6 +26,8 @@ constexpr int kDetectTimeoutSeconds = 5;
 constexpr ULONG_PTR kSyntheticInputTag = 0x4B545447;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
 constexpr wchar_t kOverlayWindowClassName[] = L"KeyTogglerOverlayWindow";
+constexpr UINT kTrayIconId = 1;
+constexpr UINT kTrayIconCallbackMessage = WM_APP + 1;
 
 enum ControlId : int {
     IDC_KEY_LABEL = 1001,
@@ -42,6 +46,7 @@ enum ControlId : int {
     IDC_OVERLAY_MONITOR_LABEL = 1016,
     IDC_OVERLAY_MONITOR_COMBO = 1017,
     IDC_OVERLAY_COLOR_PREVIEW = 1018,
+    IDC_MINIMIZE_TO_TRAY_CHECKBOX = 1019,
 };
 
 enum class InputKind {
@@ -77,6 +82,8 @@ struct MonitorEntry {
     HMONITOR handle{};
     RECT bounds{};
     std::wstring label{};
+    std::wstring deviceName{};
+    bool isPrimary = false;
 };
 
 struct AppState {
@@ -93,6 +100,7 @@ struct AppState {
     HWND overlayColorPreview{};
     HWND overlayColorButton{};
     HWND overlayMonitorCombo{};
+    HWND minimizeToTrayCheckbox{};
     HWND overlayWindow{};
     HFONT uiFont{};
     HFONT overlayFont{};
@@ -101,10 +109,18 @@ struct AppState {
 
     bool isAwaitingNewBinding = false;
     bool overlayEnabled = true;
+    UINT defaultDoubleTapMs = kDefaultDoubleTapMs;
     int overlayFontSizePx = 16;
     OverlayCorner overlayCorner = OverlayCorner::TopLeft;
     COLORREF overlayTextColor = RGB(244, 244, 245);
+    std::wstring overlayMonitorDeviceName{};
+    bool pendingMonitorSelectionRestore = false;
     std::vector<MonitorEntry> monitors{};
+    NOTIFYICONDATAW trayIconData{};
+    bool trayIconVisible = false;
+    bool minimizeToTrayEnabled = true;
+    HICON appIconLarge{};
+    HICON appIconSmall{};
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -130,6 +146,255 @@ constexpr int kMaxOverlayFontSizePx = 48;
 void SetOverlayVisible(bool visible);
 void UpdateOverlay();
 void RepositionOverlayWindow();
+void UpdateRemoveButtonEnabled();
+void SaveConfiguration();
+HICON CreateKtIcon(int sizePx);
+
+std::wstring GetConfigPath() {
+    wchar_t appDataPath[MAX_PATH]{};
+    if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) != S_OK) {
+        return L".\\key-toggler.ini";
+    }
+
+    std::wstring configDir = std::wstring(appDataPath) + L"\\KeyToggler";
+    CreateDirectoryW(configDir.c_str(), nullptr);
+    return configDir + L"\\config.ini";
+}
+
+UINT ReadConfigUInt(const std::wstring& path, const wchar_t* section, const wchar_t* key, UINT defaultValue) {
+    return static_cast<UINT>(GetPrivateProfileIntW(section, key, static_cast<int>(defaultValue), path.c_str()));
+}
+
+std::wstring ReadConfigString(
+    const std::wstring& path, const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue = L"") {
+    wchar_t buffer[256]{};
+    GetPrivateProfileStringW(section, key, defaultValue, buffer, static_cast<DWORD>(std::size(buffer)), path.c_str());
+    return buffer;
+}
+
+void LoadConfiguration() {
+    const std::wstring path = GetConfigPath();
+    gState.defaultDoubleTapMs = ReadConfigUInt(path, L"General", L"DefaultDoubleTapMs", kDefaultDoubleTapMs);
+    if (gState.defaultDoubleTapMs < kMinDoubleTapMs || gState.defaultDoubleTapMs > kMaxDoubleTapMs) {
+        gState.defaultDoubleTapMs = kDefaultDoubleTapMs;
+    }
+
+    gState.overlayEnabled = ReadConfigUInt(path, L"General", L"OverlayEnabled", 1) != 0;
+    gState.minimizeToTrayEnabled = ReadConfigUInt(path, L"General", L"MinimizeToTray", 1) != 0;
+    gState.overlayFontSizePx = static_cast<int>(ReadConfigUInt(path, L"General", L"OverlayFontSizePx", 16));
+    gState.overlayFontSizePx = std::clamp(gState.overlayFontSizePx, kMinOverlayFontSizePx, kMaxOverlayFontSizePx);
+    gState.overlayCorner =
+        ReadConfigUInt(path, L"General", L"OverlayCorner", 0) == 1 ? OverlayCorner::TopRight : OverlayCorner::TopLeft;
+    gState.overlayTextColor = static_cast<COLORREF>(ReadConfigUInt(path, L"General", L"OverlayTextColor", kDarkTextColor));
+    gState.overlayMonitorDeviceName = ReadConfigString(path, L"General", L"OverlayMonitorDeviceName", L"");
+    gState.pendingMonitorSelectionRestore = !gState.overlayMonitorDeviceName.empty();
+
+    gState.bindings.clear();
+    const UINT bindingCount = ReadConfigUInt(path, L"Bindings", L"Count", 0);
+    for (UINT i = 0; i < bindingCount; ++i) {
+        std::wstring keyName = L"Binding" + std::to_wstring(i);
+        std::wstring value = ReadConfigString(path, L"Bindings", keyName.c_str(), L"");
+        if (value.empty()) {
+            continue;
+        }
+
+        unsigned int kind = 0;
+        unsigned int code = 0;
+        unsigned int doubleTapMs = kDefaultDoubleTapMs;
+        if (swscanf(value.c_str(), L"%u:%u:%u", &kind, &code, &doubleTapMs) != 3) {
+            continue;
+        }
+
+        if (doubleTapMs < kMinDoubleTapMs || doubleTapMs > kMaxDoubleTapMs) {
+            continue;
+        }
+
+        if (kind > 1 || code > 0xFFFF) {
+            continue;
+        }
+
+        ToggleBinding binding{};
+        binding.target.kind = (kind == 0) ? InputKind::Keyboard : InputKind::MouseButton;
+        binding.target.code = code;
+        binding.doubleTapMs = doubleTapMs;
+        gState.bindings.push_back(binding);
+    }
+}
+
+void SaveConfiguration() {
+    const std::wstring path = GetConfigPath();
+    WritePrivateProfileStringW(
+        L"General", L"DefaultDoubleTapMs", std::to_wstring(gState.defaultDoubleTapMs).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"General", L"OverlayEnabled", gState.overlayEnabled ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"General",
+                               L"MinimizeToTray",
+                               gState.minimizeToTrayEnabled ? L"1" : L"0",
+                               path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayFontSizePx", std::to_wstring(gState.overlayFontSizePx).c_str(), path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayCorner", gState.overlayCorner == OverlayCorner::TopRight ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayTextColor", std::to_wstring(static_cast<unsigned int>(gState.overlayTextColor)).c_str(), path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayMonitorDeviceName", gState.overlayMonitorDeviceName.c_str(), path.c_str());
+
+    WritePrivateProfileSectionW(L"Bindings", L"", path.c_str());
+    WritePrivateProfileStringW(L"Bindings", L"Count", std::to_wstring(gState.bindings.size()).c_str(), path.c_str());
+    for (size_t i = 0; i < gState.bindings.size(); ++i) {
+        const ToggleBinding& binding = gState.bindings[i];
+        std::wstring keyName = L"Binding" + std::to_wstring(i);
+        const unsigned int kind = binding.target.kind == InputKind::Keyboard ? 0U : 1U;
+        std::wstring value = std::to_wstring(kind) + L":" + std::to_wstring(binding.target.code) + L":" +
+                             std::to_wstring(binding.doubleTapMs);
+        WritePrivateProfileStringW(L"Bindings", keyName.c_str(), value.c_str(), path.c_str());
+    }
+}
+
+void ShowTrayIcon() {
+    if (gState.window == nullptr || gState.trayIconVisible) {
+        return;
+    }
+
+    NOTIFYICONDATAW icon{};
+    icon.cbSize = sizeof(icon);
+    icon.hWnd = gState.window;
+    icon.uID = kTrayIconId;
+    icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    icon.uCallbackMessage = kTrayIconCallbackMessage;
+    icon.hIcon = nullptr;
+    if (gState.appIconSmall != nullptr) {
+        icon.hIcon = CopyIcon(gState.appIconSmall);
+    }
+    if (icon.hIcon == nullptr && gState.appIconLarge != nullptr) {
+        icon.hIcon = CopyIcon(gState.appIconLarge);
+    }
+    if (icon.hIcon == nullptr) {
+        icon.hIcon = CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
+    }
+    lstrcpynW(icon.szTip, L"Key Toggler", static_cast<int>(std::size(icon.szTip)));
+
+    if (Shell_NotifyIconW(NIM_ADD, &icon)) {
+        gState.trayIconData = icon;
+        gState.trayIconVisible = true;
+    } else if (icon.hIcon != nullptr) {
+        DestroyIcon(icon.hIcon);
+    }
+}
+
+HICON CreateKtIcon(int sizePx) {
+    if (sizePx <= 0) {
+        return nullptr;
+    }
+
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = sizePx;
+    bi.bV5Height = -sizePx;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr) {
+        return nullptr;
+    }
+
+    void* pixels = nullptr;
+    HBITMAP colorBitmap = CreateDIBSection(screenDc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &pixels, nullptr, 0);
+    ReleaseDC(nullptr, screenDc);
+    if (colorBitmap == nullptr) {
+        return nullptr;
+    }
+
+    HDC memDc = CreateCompatibleDC(nullptr);
+    if (memDc == nullptr) {
+        DeleteObject(colorBitmap);
+        return nullptr;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memDc, colorBitmap);
+    RECT fullRect{0, 0, sizePx, sizePx};
+    HBRUSH backgroundBrush = CreateSolidBrush(RGB(28, 56, 125));
+    FillRect(memDc, &fullRect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    SetBkMode(memDc, TRANSPARENT);
+    SetTextColor(memDc, RGB(244, 244, 245));
+
+    const int scaledPointSize = (sizePx * 10) / 16;
+    const int clampedPointSize = scaledPointSize < 9 ? 9 : scaledPointSize;
+    const int fontHeight = -MulDiv(clampedPointSize, GetDeviceCaps(memDc, LOGPIXELSY), 72);
+    HFONT textFont = CreateFontW(fontHeight,
+                                 0,
+                                 0,
+                                 0,
+                                 FW_BOLD,
+                                 FALSE,
+                                 FALSE,
+                                 FALSE,
+                                 DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS,
+                                 CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH | FF_DONTCARE,
+                                 L"Segoe UI");
+
+    HGDIOBJ oldFont = nullptr;
+    if (textFont != nullptr) {
+        oldFont = SelectObject(memDc, textFont);
+    }
+
+    RECT textRect{0, 0, sizePx, sizePx};
+    DrawTextW(memDc, L"KT", -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    if (oldFont != nullptr) {
+        SelectObject(memDc, oldFont);
+    }
+    if (textFont != nullptr) {
+        DeleteObject(textFont);
+    }
+
+    SelectObject(memDc, oldBitmap);
+    DeleteDC(memDc);
+
+    HBITMAP maskBitmap = CreateBitmap(sizePx, sizePx, 1, 1, nullptr);
+    ICONINFO iconInfo{};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmMask = maskBitmap;
+    iconInfo.hbmColor = colorBitmap;
+
+    HICON icon = CreateIconIndirect(&iconInfo);
+    if (maskBitmap != nullptr) {
+        DeleteObject(maskBitmap);
+    }
+    DeleteObject(colorBitmap);
+    return icon;
+}
+
+void HideTrayIcon() {
+    if (!gState.trayIconVisible) {
+        return;
+    }
+
+    Shell_NotifyIconW(NIM_DELETE, &gState.trayIconData);
+    if (gState.trayIconData.hIcon != nullptr) {
+        DestroyIcon(gState.trayIconData.hIcon);
+        gState.trayIconData.hIcon = nullptr;
+    }
+    gState.trayIconVisible = false;
+}
+
+void RestoreFromTray() {
+    ShowWindow(gState.window, SW_RESTORE);
+    ShowWindow(gState.window, SW_SHOW);
+    SetForegroundWindow(gState.window);
+    HideTrayIcon();
+}
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -306,8 +571,10 @@ BOOL CALLBACK CollectMonitorProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) 
     MonitorEntry entry{};
     entry.handle = hMonitor;
     entry.bounds = info.rcMonitor;
+    entry.isPrimary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    entry.deviceName = info.szDevice;
     entry.label = info.szDevice;
-    if ((info.dwFlags & MONITORINFOF_PRIMARY) != 0) {
+    if (entry.isPrimary) {
         entry.label += L" (Primary)";
     }
     entries->push_back(entry);
@@ -333,9 +600,29 @@ void RefreshMonitorList() {
     }
 
     if (!gState.monitors.empty()) {
-        const LRESULT selectionToApply =
-            (previousSelection >= 0 && static_cast<size_t>(previousSelection) < gState.monitors.size()) ? previousSelection : 0;
+        LRESULT selectionToApply = 0;
+        if (previousSelection >= 0 && static_cast<size_t>(previousSelection) < gState.monitors.size()) {
+            selectionToApply = previousSelection;
+        } else if (gState.pendingMonitorSelectionRestore) {
+            const auto savedIt =
+                std::find_if(gState.monitors.begin(), gState.monitors.end(), [](const MonitorEntry& monitor) {
+                    return monitor.deviceName == gState.overlayMonitorDeviceName;
+                });
+            if (savedIt != gState.monitors.end()) {
+                selectionToApply = static_cast<LRESULT>(std::distance(gState.monitors.begin(), savedIt));
+            }
+            gState.pendingMonitorSelectionRestore = false;
+        } else {
+            const auto primaryIt = std::find_if(
+                gState.monitors.begin(), gState.monitors.end(), [](const MonitorEntry& monitor) { return monitor.isPrimary; });
+            if (primaryIt != gState.monitors.end()) {
+                selectionToApply = static_cast<LRESULT>(std::distance(gState.monitors.begin(), primaryIt));
+            }
+        }
         SendMessageW(gState.overlayMonitorCombo, CB_SETCURSEL, selectionToApply, 0);
+        if (selectionToApply >= 0 && static_cast<size_t>(selectionToApply) < gState.monitors.size()) {
+            gState.overlayMonitorDeviceName = gState.monitors[static_cast<size_t>(selectionToApply)].deviceName;
+        }
     }
 }
 
@@ -406,7 +693,18 @@ void UpdateBindingsLabel() {
         SendMessageW(gState.bindingsList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
     }
 
-    EnableWindow(gState.removeButton, !gState.bindings.empty());
+    UpdateRemoveButtonEnabled();
+}
+
+void UpdateRemoveButtonEnabled() {
+    if (gState.removeButton == nullptr || gState.bindingsList == nullptr) {
+        return;
+    }
+
+    const LRESULT selectedIndex = SendMessageW(gState.bindingsList, LB_GETCURSEL, 0, 0);
+    const bool hasValidSelection =
+        selectedIndex != LB_ERR && selectedIndex >= 0 && static_cast<size_t>(selectedIndex) < gState.bindings.size();
+    EnableWindow(gState.removeButton, hasValidSelection ? TRUE : FALSE);
 }
 
 void UpdateStatus() {
@@ -551,6 +849,7 @@ void UpsertBinding(const TargetInput& target, UINT doubleTapMs) {
         binding.doubleTapMs = doubleTapMs;
         gState.bindings.push_back(binding);
     }
+    gState.defaultDoubleTapMs = doubleTapMs;
 
     if (!AnyLatched()) {
         StopRepeatTimer();
@@ -896,23 +1195,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.backgroundBrush = CreateSolidBrush(kDarkBackgroundColor);
             gState.controlBrush = CreateSolidBrush(kDarkSurfaceColor);
 
-            CreateWindowW(L"STATIC",
-                          L"Toggle input (key or mouse button):",
-                          WS_VISIBLE | WS_CHILD,
-                          20,
-                          20,
-                          350,
-                          30,
-                          hwnd,
-                          reinterpret_cast<HMENU>(IDC_KEY_LABEL),
-                          gState.instance,
-                          nullptr);
+            gState.minimizeToTrayCheckbox = CreateWindowW(L"BUTTON",
+                                                          L"Minimize to tray",
+                                                          WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                                                          20,
+                                                          16,
+                                                          220,
+                                                          28,
+                                                          hwnd,
+                                                          reinterpret_cast<HMENU>(IDC_MINIMIZE_TO_TRAY_CHECKBOX),
+                                                          gState.instance,
+                                                          nullptr);
+            SendMessageW(gState.minimizeToTrayCheckbox,
+                         BM_SETCHECK,
+                         gState.minimizeToTrayEnabled ? BST_CHECKED : BST_UNCHECKED,
+                         0);
 
             gState.addButton = CreateWindowW(L"BUTTON",
                                              L"Add New Key",
                                              WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                                              380,
-                                             18,
+                                             136,
                                              150,
                                              34,
                                              hwnd,
@@ -924,7 +1227,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Double-tap window (ms):",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          64,
+                          100,
                           220,
                           30,
                           hwnd,
@@ -933,10 +1236,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           nullptr);
 
             gState.doubleTapEdit = CreateWindowW(L"EDIT",
-                                                 L"300",
+                                                 std::to_wstring(gState.defaultDoubleTapMs).c_str(),
                                                  WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                                  245,
-                                                 62,
+                                                 98,
                                                  95,
                                                  32,
                                                  hwnd,
@@ -948,8 +1251,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                L"",
                                                WS_VISIBLE | WS_CHILD,
                                                20,
-                                               104,
-                                               700,
+                                               140,
+                                               345,
                                                28,
                                                hwnd,
                                                reinterpret_cast<HMENU>(IDC_STATUS_LABEL),
@@ -960,7 +1263,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 L"",
                                                 WS_VISIBLE | WS_CHILD | WS_BORDER | LBS_NOTIFY | WS_VSCROLL,
                                                 20,
-                                                136,
+                                                176,
                                                 640,
                                                 170,
                                                 hwnd,
@@ -971,8 +1274,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.removeButton = CreateWindowW(L"BUTTON",
                                                 L"Remove Selected",
                                                 WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-                                                20,
-                                                316,
+                                                550,
+                                                136,
                                                 170,
                                                 34,
                                                 hwnd,
@@ -984,7 +1287,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Overlay Settings",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          356,
+                          368,
                           240,
                           28,
                           hwnd,
@@ -996,20 +1299,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                    L"Enabled",
                                                    WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
                                                    20,
-                                                   390,
+                                                   402,
                                                    120,
                                                    28,
                                                    hwnd,
                                                    reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
                                                    gState.instance,
                                                    nullptr);
-            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(
+                gState.overlayCheckbox, BM_SETCHECK, gState.overlayEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
             CreateWindowW(L"STATIC",
                           L"Font:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          424,
+                          436,
                           120,
                           28,
                           hwnd,
@@ -1018,10 +1322,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           nullptr);
 
             gState.overlayFontEdit = CreateWindowW(L"EDIT",
-                                                   L"16",
+                                                   std::to_wstring(gState.overlayFontSizePx).c_str(),
                                                    WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                                    145,
-                                                   422,
+                                                   434,
                                                    50,
                                                    30,
                                                    hwnd,
@@ -1033,7 +1337,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"px",
                           WS_VISIBLE | WS_CHILD,
                           205,
-                          424,
+                          436,
                           35,
                           28,
                           hwnd,
@@ -1045,7 +1349,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                        L"",
                                                        WS_VISIBLE | WS_CHILD | SS_OWNERDRAW,
                                                        245,
-                                                       424,
+                                                       436,
                                                        45,
                                                        28,
                                                        hwnd,
@@ -1057,7 +1361,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Location:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          464,
+                          476,
                           120,
                           28,
                           hwnd,
@@ -1069,7 +1373,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       L"",
                                                       WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
                                                       145,
-                                                      462,
+                                                      474,
                                                       140,
                                                       220,
                                                       hwnd,
@@ -1078,13 +1382,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       nullptr);
             SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-left"));
             SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-right"));
-            SendMessageW(gState.overlayCornerCombo, CB_SETCURSEL, 0, 0);
+            SendMessageW(gState.overlayCornerCombo,
+                         CB_SETCURSEL,
+                         gState.overlayCorner == OverlayCorner::TopRight ? 1 : 0,
+                         0);
 
             gState.overlayColorButton = CreateWindowW(L"BUTTON",
                                                       L"Select Color...",
                                                       WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                                                       300,
-                                                      422,
+                                                      434,
                                                       150,
                                                       30,
                                                       hwnd,
@@ -1096,7 +1403,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Monitor:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          504,
+                          516,
                           120,
                           28,
                           hwnd,
@@ -1108,7 +1415,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                        L"",
                                                        WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
                                                        145,
-                                                       502,
+                                                       514,
                                                        340,
                                                        220,
                                                        hwnd,
@@ -1148,6 +1455,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             SetAwaitingNewBinding(false);
             UpdateStatus();
+            UpdateRemoveButtonEnabled();
             return 0;
         }
 
@@ -1217,15 +1525,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_DROPDOWN) {
                 RefreshMonitorList();
             } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                LRESULT selected = SendMessageW(gState.overlayMonitorCombo, CB_GETCURSEL, 0, 0);
+                if (selected >= 0 && static_cast<size_t>(selected) < gState.monitors.size()) {
+                    gState.overlayMonitorDeviceName = gState.monitors[static_cast<size_t>(selected)].deviceName;
+                }
                 RepositionOverlayWindow();
+            } else if (LOWORD(wParam) == IDC_MINIMIZE_TO_TRAY_CHECKBOX) {
+                gState.minimizeToTrayEnabled =
+                    (SendMessageW(gState.minimizeToTrayCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            } else if (LOWORD(wParam) == IDC_BINDINGS_LIST && HIWORD(wParam) == LBN_SELCHANGE) {
+                UpdateRemoveButtonEnabled();
             }
             return 0;
         }
 
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED && gState.minimizeToTrayEnabled) {
+                ShowTrayIcon();
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            return 0;
+
+        case kTrayIconCallbackMessage:
+            if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+                RestoreFromTray();
+            }
+            return 0;
+
         case WM_DESTROY:
+            SaveConfiguration();
             StopDetectMode(true);
             StopAllLatchedState();
             UninstallHooks();
+            HideTrayIcon();
             if (gState.overlayWindow != nullptr) {
                 DestroyWindow(gState.overlayWindow);
                 gState.overlayWindow = nullptr;
@@ -1245,6 +1577,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (gState.controlBrush != nullptr) {
                 DeleteObject(gState.controlBrush);
                 gState.controlBrush = nullptr;
+            }
+            if (gState.appIconLarge != nullptr) {
+                DestroyIcon(gState.appIconLarge);
+                gState.appIconLarge = nullptr;
+            }
+            if (gState.appIconSmall != nullptr) {
+                DestroyIcon(gState.appIconSmall);
+                gState.appIconSmall = nullptr;
             }
             PostQuitMessage(0);
             return 0;
@@ -1312,26 +1652,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     gState.instance = hInstance;
+    gState.appIconLarge = CreateKtIcon(GetSystemMetrics(SM_CXICON));
+    gState.appIconSmall = CreateKtIcon(GetSystemMetrics(SM_CXSMICON));
+    if (gState.appIconSmall == nullptr && gState.appIconLarge != nullptr) {
+        gState.appIconSmall = CopyIcon(gState.appIconLarge);
+    }
+    LoadConfiguration();
 
-    WNDCLASSW wc{};
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = kWindowClassName;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = (gState.appIconLarge != nullptr) ? gState.appIconLarge : LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIconSm = (gState.appIconSmall != nullptr) ? gState.appIconSmall : LoadIcon(nullptr, IDI_APPLICATION);
 
-    if (!RegisterClassW(&wc)) {
+    if (!RegisterClassExW(&wc)) {
         MessageBoxW(nullptr, L"Failed to register window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    WNDCLASSW overlayWc{};
+    WNDCLASSEXW overlayWc{};
+    overlayWc.cbSize = sizeof(overlayWc);
     overlayWc.lpfnWndProc = OverlayWindowProc;
     overlayWc.hInstance = hInstance;
     overlayWc.lpszClassName = kOverlayWindowClassName;
     overlayWc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     overlayWc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
 
-    if (!RegisterClassW(&overlayWc)) {
+    if (!RegisterClassExW(&overlayWc)) {
         MessageBoxW(nullptr, L"Failed to register overlay window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
@@ -1343,7 +1693,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     760,
-                                    610,
+                                    660,
                                     nullptr,
                                     nullptr,
                                     hInstance,
