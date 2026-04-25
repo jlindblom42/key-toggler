@@ -8,6 +8,9 @@
 namespace {
 
 constexpr int kDoubleTapMs = 300;
+constexpr UINT_PTR kRepeatTimerId = 1;
+constexpr UINT kInitialRepeatDelayMs = 400;
+constexpr UINT kRepeatIntervalMs = 33;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
 
 enum ControlId : int {
@@ -66,6 +69,18 @@ void SendVirtualKey(UINT vk, bool down) {
     SendInput(1, &input, sizeof(INPUT));
 }
 
+void StopRepeatTimer() {
+    if (gState.window != nullptr) {
+        KillTimer(gState.window, kRepeatTimerId);
+    }
+}
+
+void StartRepeatTimer() {
+    if (gState.window != nullptr) {
+        SetTimer(gState.window, kRepeatTimerId, kInitialRepeatDelayMs, nullptr);
+    }
+}
+
 UINT ParseKeyFromEdit() {
     wchar_t text[32]{};
     GetWindowTextW(gState.keyEdit, text, static_cast<int>(std::size(text)));
@@ -97,6 +112,7 @@ void ApplyConfiguredKey() {
 
     if (gState.keyLatched) {
         SendVirtualKey(gState.targetVk, false);
+        StopRepeatTimer();
         gState.keyLatched = false;
     }
 
@@ -125,6 +141,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     if (gState.keyLatched) {
         if (isDown) {
             SendVirtualKey(gState.targetVk, false);
+            StopRepeatTimer();
             gState.keyLatched = false;
             gState.ignoreNextPhysicalUp = true;
             gState.hasFirstTap = false;
@@ -146,6 +163,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - gState.lastPhysicalDown).count();
             if (elapsedMs <= kDoubleTapMs) {
                 SendVirtualKey(gState.targetVk, true);
+                StartRepeatTimer();
                 gState.keyLatched = true;
                 gState.ignoreNextPhysicalUp = true;
                 gState.hasFirstTap = false;
@@ -225,7 +243,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                nullptr);
 
             CreateWindowW(L"STATIC",
-                          L"Behavior: double tap configured key to latch down; tap/hold once to release.",
+                          L"Behavior: double tap configured key to latch and auto-repeat; tap/hold once to release.",
                           WS_VISIBLE | WS_CHILD,
                           20,
                           90,
@@ -252,8 +270,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendVirtualKey(gState.targetVk, false);
                 gState.keyLatched = false;
             }
+            StopRepeatTimer();
             UninstallHook();
             PostQuitMessage(0);
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == kRepeatTimerId && gState.keyLatched) {
+                SendVirtualKey(gState.targetVk, true);
+                SetTimer(gState.window, kRepeatTimerId, kRepeatIntervalMs, nullptr);
+            }
             return 0;
 
         default:
