@@ -4,7 +4,6 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
-#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -31,7 +30,8 @@ enum ControlId : int {
     IDC_DOUBLE_TAP_LABEL = 1006,
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_DETECT_BUTTON = 1008,
-    IDC_BINDINGS_LABEL = 1009,
+    IDC_BINDINGS_LIST = 1009,
+    IDC_REMOVE_BUTTON = 1010,
 };
 
 enum class InputKind {
@@ -41,7 +41,7 @@ enum class InputKind {
 
 struct TargetInput {
     InputKind kind{InputKind::Keyboard};
-    UINT code{'T'};
+    UINT code{0};
 };
 
 struct ToggleBinding {
@@ -65,7 +65,10 @@ struct AppState {
     HWND doubleTapEdit{};
     HWND statusLabel{};
     HWND detectButton{};
-    HWND bindingsLabel{};
+    HWND bindingsList{};
+    HWND removeButton{};
+
+    bool isAwaitingNewBinding = false;
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -77,25 +80,6 @@ struct AppState {
 };
 
 AppState gState;
-
-std::wstring TrimAndUpper(std::wstring text) {
-    size_t start = 0;
-    while (start < text.size() && std::iswspace(text[start]) != 0) {
-        ++start;
-    }
-
-    size_t end = text.size();
-    while (end > start && std::iswspace(text[end - 1]) != 0) {
-        --end;
-    }
-
-    std::wstring trimmed = text.substr(start, end - start);
-    for (wchar_t& ch : trimmed) {
-        ch = static_cast<wchar_t>(std::towupper(ch));
-    }
-
-    return trimmed;
-}
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -160,16 +144,18 @@ bool AnyLatched() {
 }
 
 void UpdateBindingsLabel() {
-    std::wstring text = L"Configured keys:";
-    if (gState.bindings.empty()) {
-        text += L" (none)";
-    } else {
-        for (const auto& binding : gState.bindings) {
-            text += L"\r\n- " + InputToDisplay(binding.target) + L" (" + std::to_wstring(binding.doubleTapMs) + L" ms)";
-        }
+    if (gState.bindingsList == nullptr) {
+        return;
     }
 
-    SetWindowTextW(gState.bindingsLabel, text.c_str());
+    SendMessageW(gState.bindingsList, LB_RESETCONTENT, 0, 0);
+    for (const auto& binding : gState.bindings) {
+        std::wstring line =
+            InputToDisplay(binding.target) + L" (" + std::to_wstring(binding.doubleTapMs) + L" ms)";
+        SendMessageW(gState.bindingsList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+    }
+
+    EnableWindow(gState.removeButton, !gState.bindings.empty());
 }
 
 void UpdateStatus() {
@@ -240,6 +226,16 @@ void StopDetectMode(bool restoreButtonText) {
     }
 }
 
+
+void SetAwaitingNewBinding(bool awaiting) {
+    gState.isAwaitingNewBinding = awaiting;
+    ShowWindow(gState.keyEdit, awaiting ? SW_SHOW : SW_HIDE);
+    ShowWindow(gState.detectButton, awaiting ? SW_SHOW : SW_HIDE);
+    if (!awaiting) {
+        SetWindowTextW(gState.keyEdit, L"");
+    }
+}
+
 void StopAllLatchedState() {
     for (auto& binding : gState.bindings) {
         if (binding.keyLatched) {
@@ -254,63 +250,6 @@ void StopAllLatchedState() {
     }
 
     StopRepeatTimer();
-}
-
-bool ParseInputToken(const std::wstring& rawText, TargetInput& outInput) {
-    std::wstring text = TrimAndUpper(rawText);
-
-    if (text.empty()) {
-        return false;
-    }
-
-    struct NamedInput {
-        const wchar_t* name;
-        TargetInput input;
-    };
-
-    constexpr NamedInput namedInputs[] = {
-        {L"SHIFT", {InputKind::Keyboard, VK_SHIFT}},     {L"ALT", {InputKind::Keyboard, VK_MENU}},
-        {L"CTRL", {InputKind::Keyboard, VK_CONTROL}},    {L"CONTROL", {InputKind::Keyboard, VK_CONTROL}},
-        {L"SPACE", {InputKind::Keyboard, VK_SPACE}},     {L"TAB", {InputKind::Keyboard, VK_TAB}},
-        {L"ENTER", {InputKind::Keyboard, VK_RETURN}},    {L"ESC", {InputKind::Keyboard, VK_ESCAPE}},
-        {L"ESCAPE", {InputKind::Keyboard, VK_ESCAPE}},   {L"UP", {InputKind::Keyboard, VK_UP}},
-        {L"DOWN", {InputKind::Keyboard, VK_DOWN}},       {L"LEFT", {InputKind::Keyboard, VK_LEFT}},
-        {L"RIGHT", {InputKind::Keyboard, VK_RIGHT}},     {L"MOUSE1", {InputKind::MouseButton, VK_LBUTTON}},
-        {L"MOUSE2", {InputKind::MouseButton, VK_RBUTTON}},
-        {L"MOUSE3", {InputKind::MouseButton, VK_MBUTTON}},
-        {L"MOUSE4", {InputKind::MouseButton, VK_XBUTTON1}},
-        {L"MOUSE5", {InputKind::MouseButton, VK_XBUTTON2}},
-        {L"LEFTCLICK", {InputKind::MouseButton, VK_LBUTTON}},
-        {L"RIGHTCLICK", {InputKind::MouseButton, VK_RBUTTON}},
-        {L"MIDDLECLICK", {InputKind::MouseButton, VK_MBUTTON}},
-        {L"XBUTTON1", {InputKind::MouseButton, VK_XBUTTON1}},
-        {L"XBUTTON2", {InputKind::MouseButton, VK_XBUTTON2}},
-    };
-
-    for (const auto& namedInput : namedInputs) {
-        if (text == namedInput.name) {
-            outInput = namedInput.input;
-            return true;
-        }
-    }
-
-    if (text.size() == 1) {
-        SHORT vk = VkKeyScanW(text[0]);
-        if (vk == -1) {
-            return false;
-        }
-
-        outInput = {InputKind::Keyboard, static_cast<UINT>(LOBYTE(vk))};
-        return true;
-    }
-
-    return false;
-}
-
-bool ParseInputFromEdit(TargetInput& outInput) {
-    wchar_t text[64]{};
-    GetWindowTextW(gState.keyEdit, text, static_cast<int>(std::size(text)));
-    return ParseInputToken(text, outInput);
 }
 
 bool ParseDoubleTapMs(UINT& outMs) {
@@ -363,29 +302,42 @@ void UpsertBinding(const TargetInput& target, UINT doubleTapMs) {
     UpdateStatus();
 }
 
+void RemoveSelectedBinding() {
+    LRESULT selectedIndex = SendMessageW(gState.bindingsList, LB_GETCURSEL, 0, 0);
+    if (selectedIndex == LB_ERR) {
+        MessageBoxW(gState.window, L"Select a configured key/button to remove.", L"Nothing selected", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    ToggleBinding& binding = gState.bindings[static_cast<size_t>(selectedIndex)];
+    if (binding.keyLatched) {
+        SendInputDownOrUp(binding.target, false);
+    }
+
+    gState.bindings.erase(gState.bindings.begin() + selectedIndex);
+    if (!AnyLatched()) {
+        StopRepeatTimer();
+    }
+    UpdateStatus();
+}
+
 void AddConfiguredInput() {
-    TargetInput parsedInput{};
-    if (!ParseInputFromEdit(parsedInput)) {
+    if (gState.isAwaitingNewBinding) {
         MessageBoxW(gState.window,
-                    L"Please enter a valid key or button (for example: T, SHIFT, ALT, MOUSE1, MOUSE2).",
-                    L"Invalid input",
-                    MB_OK | MB_ICONWARNING);
+                    L"Click Detect and press the key/button to finish adding this binding.",
+                    L"Waiting for detection",
+                    MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    UINT parsedDoubleTapMs = 0;
-    if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
-        MessageBoxW(gState.window,
-                    L"Please enter a valid double-tap window in milliseconds (50-2000).",
-                    L"Invalid double-tap window",
-                    MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    UpsertBinding(parsedInput, parsedDoubleTapMs);
+    SetAwaitingNewBinding(true);
 }
 
 void BeginDetectMode() {
+    if (!gState.isAwaitingNewBinding) {
+        MessageBoxW(gState.window, L"Press Add New Key first.", L"Add key first", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     UINT parsedDoubleTapMs = 0;
     if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
         MessageBoxW(gState.window,
@@ -407,7 +359,20 @@ void BeginDetectMode() {
 void CaptureDetectedInput(const TargetInput& detected) {
     std::wstring inputName = InputToDisplay(detected);
     SetWindowTextW(gState.keyEdit, inputName.c_str());
+
+    UINT parsedDoubleTapMs = 0;
+    if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
+        MessageBoxW(gState.window,
+                    L"Please enter a valid double-tap window in milliseconds (50-2000).",
+                    L"Invalid double-tap window",
+                    MB_OK | MB_ICONWARNING);
+        StopDetectMode(true);
+        return;
+    }
+
+    UpsertBinding(detected, parsedDoubleTapMs);
     StopDetectMode(true);
+    SetAwaitingNewBinding(false);
 }
 
 bool IsInjectedKeyboard(const KBDLLHOOKSTRUCT* data) {
@@ -635,12 +600,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           gState.instance,
                           nullptr);
 
+            CreateWindowW(L"BUTTON",
+                          L"Add New Key",
+                          WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                          240,
+                          18,
+                          110,
+                          24,
+                          hwnd,
+                          reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
+                          gState.instance,
+                          nullptr);
+
             gState.keyEdit = CreateWindowW(L"EDIT",
-                                           L"T",
-                                           WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                                           240,
+                                           L"",
+                                           WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
+                                           360,
                                            18,
-                                           140,
+                                           190,
                                            24,
                                            hwnd,
                                            reinterpret_cast<HMENU>(IDC_KEY_EDIT),
@@ -649,27 +626,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             gState.detectButton = CreateWindowW(L"BUTTON",
                                                 L"Detect (5s)",
-                                                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                                                390,
+                                                WS_CHILD | BS_PUSHBUTTON,
+                                                560,
                                                 18,
-                                                90,
+                                                100,
                                                 24,
                                                 hwnd,
                                                 reinterpret_cast<HMENU>(IDC_DETECT_BUTTON),
                                                 gState.instance,
                                                 nullptr);
-
-            CreateWindowW(L"BUTTON",
-                          L"Add New Key",
-                          WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                          490,
-                          18,
-                          95,
-                          24,
-                          hwnd,
-                          reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
-                          gState.instance,
-                          nullptr);
 
             CreateWindowW(L"STATIC",
                           L"Double-tap window (ms):",
@@ -700,39 +665,52 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                WS_VISIBLE | WS_CHILD,
                                                20,
                                                84,
-                                               560,
+                                               700,
                                                20,
                                                hwnd,
                                                reinterpret_cast<HMENU>(IDC_STATUS_LABEL),
                                                gState.instance,
                                                nullptr);
 
-            gState.bindingsLabel = CreateWindowW(L"STATIC",
-                                                 L"",
-                                                 WS_VISIBLE | WS_CHILD,
-                                                 20,
-                                                 110,
-                                                 560,
-                                                 60,
-                                                 hwnd,
-                                                 reinterpret_cast<HMENU>(IDC_BINDINGS_LABEL),
-                                                 gState.instance,
-                                                 nullptr);
+            gState.bindingsList = CreateWindowW(L"LISTBOX",
+                                                L"",
+                                                WS_VISIBLE | WS_CHILD | WS_BORDER | LBS_NOTIFY | WS_VSCROLL,
+                                                20,
+                                                110,
+                                                640,
+                                                140,
+                                                hwnd,
+                                                reinterpret_cast<HMENU>(IDC_BINDINGS_LIST),
+                                                gState.instance,
+                                                nullptr);
+
+            gState.removeButton = CreateWindowW(L"BUTTON",
+                                                L"Remove Selected",
+                                                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                                                20,
+                                                258,
+                                                140,
+                                                24,
+                                                hwnd,
+                                                reinterpret_cast<HMENU>(IDC_REMOVE_BUTTON),
+                                                gState.instance,
+                                                nullptr);
 
             CreateWindowW(L"STATIC",
                           L"Behavior: each configured key/button toggles independently; double tap to latch."
                           L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
-                          L"Use Add New Key to append another key, or re-add to update its timing.",
+                          L"Press Add New Key, then Detect to capture one input. Repeat Add New Key for each extra binding.",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          176,
-                          560,
+                          292,
+                          700,
                           40,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_TIPS_LABEL),
                           gState.instance,
                           nullptr);
 
+            SetAwaitingNewBinding(false);
             UpdateStatus();
             return 0;
         }
@@ -742,6 +720,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_DETECT_BUTTON) {
                 BeginDetectMode();
+            } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
+                RemoveSelectedBinding();
             }
             return 0;
         }
@@ -814,8 +794,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
-                                    620,
-                                    270,
+                                    760,
+                                    390,
                                     nullptr,
                                     nullptr,
                                     hInstance,
