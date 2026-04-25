@@ -1655,8 +1655,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         continue;
                     }
 
-                hasAnyLatched = true;
-                    if (binding.target.kind == InputKind::Keyboard && now >= binding.nextRepeatAt) {
+                    hasAnyLatched = true;
+                    if (now >= binding.nextRepeatAt) {
                         SendInputDownOrUp(binding.target, true);
                         binding.nextRepeatAt = now + std::chrono::milliseconds(kRepeatIntervalMs);
                     }
