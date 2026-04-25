@@ -150,6 +150,32 @@ void UpdateRemoveButtonEnabled();
 void SaveConfiguration();
 HICON CreateKtIcon(int sizePx);
 
+bool IsExtendedKeyboardVk(UINT vk) {
+    switch (vk) {
+        case VK_INSERT:
+        case VK_DELETE:
+        case VK_HOME:
+        case VK_END:
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_LEFT:
+        case VK_RIGHT:
+        case VK_UP:
+        case VK_DOWN:
+        case VK_NUMLOCK:
+        case VK_DIVIDE:
+        case VK_RCONTROL:
+        case VK_RMENU:
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_APPS:
+        case VK_SNAPSHOT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 std::wstring GetConfigPath() {
     wchar_t appDataPath[MAX_PATH]{};
     if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) != S_OK) {
@@ -724,9 +750,21 @@ void UpdateStatus() {
 void SendInputDownOrUp(const TargetInput& input, bool down) {
     INPUT nativeInput{};
     if (input.kind == InputKind::Keyboard) {
+        const WORD scanCode = static_cast<WORD>(MapVirtualKeyW(input.code, MAPVK_VK_TO_VSC));
+        if (scanCode == 0) {
+            return;
+        }
+
         nativeInput.type = INPUT_KEYBOARD;
-        nativeInput.ki.wVk = static_cast<WORD>(input.code);
-        nativeInput.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        nativeInput.ki.wVk = 0;
+        nativeInput.ki.wScan = scanCode;
+        nativeInput.ki.dwFlags = KEYEVENTF_SCANCODE;
+        if (!down) {
+            nativeInput.ki.dwFlags |= KEYEVENTF_KEYUP;
+        }
+        if (IsExtendedKeyboardVk(input.code)) {
+            nativeInput.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        }
     } else {
         nativeInput.type = INPUT_MOUSE;
         switch (input.code) {
