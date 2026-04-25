@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <array>
@@ -24,7 +25,6 @@ constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
 
 enum ControlId : int {
     IDC_KEY_LABEL = 1001,
-    IDC_KEY_EDIT = 1002,
     IDC_ADD_BUTTON = 1003,
     IDC_STATUS_LABEL = 1004,
     IDC_TIPS_LABEL = 1005,
@@ -61,12 +61,14 @@ struct ToggleBinding {
 struct AppState {
     HINSTANCE instance{};
     HWND window{};
-    HWND keyEdit{};
     HWND doubleTapEdit{};
     HWND statusLabel{};
     HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
+    HFONT uiFont{};
+    HBRUSH backgroundBrush{};
+    HBRUSH controlBrush{};
 
     bool isAwaitingNewBinding = false;
 
@@ -80,6 +82,13 @@ struct AppState {
 };
 
 AppState gState;
+
+constexpr COLORREF kDarkBackgroundColor = RGB(24, 24, 27);
+constexpr COLORREF kDarkSurfaceColor = RGB(39, 39, 42);
+constexpr COLORREF kDarkTextColor = RGB(244, 244, 245);
+constexpr COLORREF kDarkButtonColor = RGB(63, 63, 70);
+constexpr COLORREF kDarkButtonHoverColor = RGB(82, 82, 91);
+constexpr COLORREF kDarkButtonDisabledColor = RGB(51, 51, 56);
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -245,10 +254,6 @@ void StopDetectMode(bool restoreButtonText) {
 
 void SetAwaitingNewBinding(bool awaiting) {
     gState.isAwaitingNewBinding = awaiting;
-    ShowWindow(gState.keyEdit, awaiting ? SW_SHOW : SW_HIDE);
-    if (!awaiting) {
-        SetWindowTextW(gState.keyEdit, L"");
-    }
 }
 
 void StopAllLatchedState() {
@@ -366,9 +371,6 @@ void AddConfiguredInput() {
 }
 
 void CaptureDetectedInput(const TargetInput& detected) {
-    std::wstring inputName = InputToDisplay(detected);
-    SetWindowTextW(gState.keyEdit, inputName.c_str());
-
     UINT parsedDoubleTapMs = 0;
     if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
         MessageBoxW(gState.window,
@@ -594,16 +596,36 @@ void UninstallHooks() {
     }
 }
 
+void ApplyUiFont(HWND hwnd) {
+    if (gState.uiFont != nullptr) {
+        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(gState.uiFont), TRUE);
+    }
+}
+
+void TryEnableDarkTitleBar(HWND hwnd) {
+    const BOOL enableDarkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enableDarkMode, sizeof(enableDarkMode));
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
+            NONCLIENTMETRICSW metrics{};
+            metrics.cbSize = sizeof(metrics);
+            SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+            metrics.lfMessageFont.lfHeight = -19;
+            metrics.lfMessageFont.lfWeight = FW_MEDIUM;
+            gState.uiFont = CreateFontIndirectW(&metrics.lfMessageFont);
+            gState.backgroundBrush = CreateSolidBrush(kDarkBackgroundColor);
+            gState.controlBrush = CreateSolidBrush(kDarkSurfaceColor);
+
             CreateWindowW(L"STATIC",
                           L"Toggle input (key or mouse button):",
                           WS_VISIBLE | WS_CHILD,
                           20,
                           20,
-                          220,
-                          20,
+                          350,
+                          30,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_KEY_LABEL),
                           gState.instance,
@@ -611,35 +633,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             gState.addButton = CreateWindowW(L"BUTTON",
                                              L"Add New Key",
-                                             WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                                             240,
+                                             WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                                             380,
                                              18,
-                                             120,
-                                             24,
+                                             150,
+                                             34,
                                              hwnd,
                                              reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
                                              gState.instance,
                                              nullptr);
 
-            gState.keyEdit = CreateWindowW(L"EDIT",
-                                           L"",
-                                           WS_CHILD | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
-                                           370,
-                                           18,
-                                           190,
-                                           24,
-                                           hwnd,
-                                           reinterpret_cast<HMENU>(IDC_KEY_EDIT),
-                                           gState.instance,
-                                           nullptr);
-
             CreateWindowW(L"STATIC",
                           L"Double-tap window (ms):",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          52,
-                          180,
-                          20,
+                          64,
+                          220,
+                          30,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_DOUBLE_TAP_LABEL),
                           gState.instance,
@@ -648,10 +658,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.doubleTapEdit = CreateWindowW(L"EDIT",
                                                  L"300",
                                                  WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                                                 210,
-                                                 50,
-                                                 80,
-                                                 24,
+                                                 245,
+                                                 62,
+                                                 95,
+                                                 32,
                                                  hwnd,
                                                  reinterpret_cast<HMENU>(IDC_DOUBLE_TAP_EDIT),
                                                  gState.instance,
@@ -661,9 +671,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                L"",
                                                WS_VISIBLE | WS_CHILD,
                                                20,
-                                               84,
+                                               104,
                                                700,
-                                               20,
+                                               28,
                                                hwnd,
                                                reinterpret_cast<HMENU>(IDC_STATUS_LABEL),
                                                gState.instance,
@@ -673,9 +683,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 L"",
                                                 WS_VISIBLE | WS_CHILD | WS_BORDER | LBS_NOTIFY | WS_VSCROLL,
                                                 20,
-                                                110,
+                                                136,
                                                 640,
-                                                140,
+                                                170,
                                                 hwnd,
                                                 reinterpret_cast<HMENU>(IDC_BINDINGS_LIST),
                                                 gState.instance,
@@ -683,11 +693,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             gState.removeButton = CreateWindowW(L"BUTTON",
                                                 L"Remove Selected",
-                                                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                                                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                                                 20,
-                                                258,
-                                                140,
-                                                24,
+                                                316,
+                                                170,
+                                                34,
                                                 hwnd,
                                                 reinterpret_cast<HMENU>(IDC_REMOVE_BUTTON),
                                                 gState.instance,
@@ -699,17 +709,62 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Press Add New Key and then press one key/button within 5 seconds. Repeat Add New Key for each extra binding.",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          292,
+                          360,
                           700,
-                          40,
+                          88,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_TIPS_LABEL),
                           gState.instance,
                           nullptr);
 
+            TryEnableDarkTitleBar(hwnd);
+
+            HWND currentControl = GetWindow(hwnd, GW_CHILD);
+            while (currentControl != nullptr) {
+                ApplyUiFont(currentControl);
+                currentControl = GetWindow(currentControl, GW_HWNDNEXT);
+            }
+
             SetAwaitingNewBinding(false);
             UpdateStatus();
             return 0;
+        }
+
+        case WM_DRAWITEM: {
+            const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+            if (drawItem == nullptr ||
+                (drawItem->CtlID != IDC_ADD_BUTTON && drawItem->CtlID != IDC_REMOVE_BUTTON)) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+
+            COLORREF fillColor = kDarkButtonColor;
+            if ((drawItem->itemState & ODS_DISABLED) != 0) {
+                fillColor = kDarkButtonDisabledColor;
+            } else if ((drawItem->itemState & ODS_HOTLIGHT) != 0 || (drawItem->itemState & ODS_SELECTED) != 0) {
+                fillColor = kDarkButtonHoverColor;
+            }
+
+            HBRUSH buttonBrush = CreateSolidBrush(fillColor);
+            FillRect(drawItem->hDC, &drawItem->rcItem, buttonBrush);
+            DeleteObject(buttonBrush);
+
+            SetBkMode(drawItem->hDC, TRANSPARENT);
+            SetTextColor(drawItem->hDC, kDarkTextColor);
+            if (gState.uiFont != nullptr) {
+                SelectObject(drawItem->hDC, gState.uiFont);
+            }
+
+            std::array<wchar_t, 64> caption{};
+            GetWindowTextW(drawItem->hwndItem, caption.data(), static_cast<int>(caption.size()));
+            RECT textRect = drawItem->rcItem;
+            DrawTextW(drawItem->hDC, caption.data(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            if ((drawItem->itemState & ODS_FOCUS) != 0) {
+                RECT focusRect = drawItem->rcItem;
+                InflateRect(&focusRect, -3, -3);
+                DrawFocusRect(drawItem->hDC, &focusRect);
+            }
+            return TRUE;
         }
 
         case WM_COMMAND: {
@@ -725,8 +780,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StopDetectMode(true);
             StopAllLatchedState();
             UninstallHooks();
+            if (gState.uiFont != nullptr) {
+                DeleteObject(gState.uiFont);
+                gState.uiFont = nullptr;
+            }
+            if (gState.backgroundBrush != nullptr) {
+                DeleteObject(gState.backgroundBrush);
+                gState.backgroundBrush = nullptr;
+            }
+            if (gState.controlBrush != nullptr) {
+                DeleteObject(gState.controlBrush);
+                gState.controlBrush = nullptr;
+            }
             PostQuitMessage(0);
             return 0;
+
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLORBTN: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, kDarkTextColor);
+            const COLORREF backgroundColor = (msg == WM_CTLCOLORSTATIC) ? kDarkBackgroundColor : kDarkSurfaceColor;
+            SetBkColor(dc, backgroundColor);
+            HBRUSH brush = (msg == WM_CTLCOLORSTATIC) ? gState.backgroundBrush : gState.controlBrush;
+            return reinterpret_cast<LRESULT>(brush != nullptr ? brush : GetStockObject(BLACK_BRUSH));
+        }
+
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, gState.backgroundBrush != nullptr ? gState.backgroundBrush : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            return 1;
+        }
 
         case WM_TIMER:
             if (wParam == kRepeatTimerId) {
@@ -791,7 +877,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     760,
-                                    390,
+                                    560,
                                     nullptr,
                                     nullptr,
                                     hInstance,
