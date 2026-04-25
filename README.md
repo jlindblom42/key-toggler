@@ -1,14 +1,17 @@
 # key-toggler
 
-A lightweight Windows GUI app that latches a configured key or mouse button as "held down" when you double tap it.
+A lightweight Windows GUI app that latches configured keys or mouse buttons as "held down" when you double tap them.
 
 ## Behavior
 
-- Configure a trigger input (default: `T`).
+- Configure a trigger input (default text: `T`).
 - Supported typed names include keyboard keys like `SHIFT`, `ALT`, `CTRL`, arrows, and mouse buttons like `MOUSE1`-`MOUSE5`.
-- You can also click **Detect (5s)** and press a key/button once within 5 seconds to configure it.
-- Double tap the configured input quickly (within the configured window, default 300 ms) to latch it down.
-- Tap or hold the configured input once to release the latch.
+- You can click **Detect (5s)** and press a key/button once within 5 seconds to fill the input box.
+- Click **Add New Key** to add that key/button with the configured double-tap window.
+- Each configured key/button behaves independently:
+  - Double tap it quickly (within its configured window, default 300 ms) to latch it down.
+  - Tap or hold that same key/button once to release only that key/button latch.
+- Re-adding an existing key/button updates its timing.
 
 ## Build locally (Windows)
 

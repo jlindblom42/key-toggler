@@ -1,10 +1,12 @@
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cwctype>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -15,6 +17,7 @@ constexpr UINT_PTR kRepeatTimerId = 1;
 constexpr UINT_PTR kDetectTimerId = 2;
 constexpr UINT kInitialRepeatDelayMs = 400;
 constexpr UINT kRepeatIntervalMs = 33;
+constexpr UINT kRepeatPumpIntervalMs = 10;
 constexpr UINT kDetectCountdownMs = 1000;
 constexpr int kDetectTimeoutSeconds = 5;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
@@ -22,12 +25,13 @@ constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
 enum ControlId : int {
     IDC_KEY_LABEL = 1001,
     IDC_KEY_EDIT = 1002,
-    IDC_APPLY_BUTTON = 1003,
+    IDC_ADD_BUTTON = 1003,
     IDC_STATUS_LABEL = 1004,
     IDC_TIPS_LABEL = 1005,
     IDC_DOUBLE_TAP_LABEL = 1006,
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_DETECT_BUTTON = 1008,
+    IDC_BINDINGS_LABEL = 1009,
 };
 
 enum class InputKind {
@@ -40,6 +44,20 @@ struct TargetInput {
     UINT code{'T'};
 };
 
+struct ToggleBinding {
+    TargetInput target{};
+    UINT doubleTapMs = kDefaultDoubleTapMs;
+
+    bool keyLatched = false;
+    bool releaseLatchedOnNextPhysicalUp = false;
+    bool suppressPhysicalUntilUp = false;
+    bool physicalInputIsDown = false;
+    std::chrono::steady_clock::time_point lastPhysicalDown{};
+    bool hasFirstTap = false;
+
+    std::chrono::steady_clock::time_point nextRepeatAt{};
+};
+
 struct AppState {
     HINSTANCE instance{};
     HWND window{};
@@ -47,19 +65,12 @@ struct AppState {
     HWND doubleTapEdit{};
     HWND statusLabel{};
     HWND detectButton{};
+    HWND bindingsLabel{};
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
 
-    TargetInput target{};
-    UINT doubleTapMs = kDefaultDoubleTapMs;
-    bool keyLatched = false;
-    bool releaseLatchedOnNextPhysicalUp = false;
-    bool suppressPhysicalUntilUp = false;
-    bool physicalInputIsDown = false;
-    std::chrono::steady_clock::time_point lastPhysicalDown{};
-
-    bool hasFirstTap = false;
+    std::vector<ToggleBinding> bindings{};
 
     bool isDetectingInput = false;
     int detectSecondsRemaining = 0;
@@ -138,11 +149,40 @@ std::wstring InputToDisplay(const TargetInput& input) {
     return input.kind == InputKind::Keyboard ? KeyboardVkToDisplay(input.code) : MouseVkToDisplay(input.code);
 }
 
+bool InputsEqual(const TargetInput& lhs, const TargetInput& rhs) {
+    return lhs.kind == rhs.kind && lhs.code == rhs.code;
+}
+
+bool AnyLatched() {
+    return std::any_of(gState.bindings.begin(),
+                       gState.bindings.end(),
+                       [](const ToggleBinding& binding) { return binding.keyLatched; });
+}
+
+void UpdateBindingsLabel() {
+    std::wstring text = L"Configured keys:";
+    if (gState.bindings.empty()) {
+        text += L" (none)";
+    } else {
+        for (const auto& binding : gState.bindings) {
+            text += L"\r\n- " + InputToDisplay(binding.target) + L" (" + std::to_wstring(binding.doubleTapMs) + L" ms)";
+        }
+    }
+
+    SetWindowTextW(gState.bindingsLabel, text.c_str());
+}
+
 void UpdateStatus() {
-    std::wstring status = L"Status: " + std::wstring(gState.keyLatched ? L"Latched" : L"Not latched") +
-                          L" | Configured input: " + InputToDisplay(gState.target) +
-                          L" | Double tap window: " + std::to_wstring(gState.doubleTapMs) + L" ms";
+    const int latchedCount = static_cast<int>(std::count_if(gState.bindings.begin(),
+                                                            gState.bindings.end(),
+                                                            [](const ToggleBinding& binding) {
+                                                                return binding.keyLatched;
+                                                            }));
+
+    std::wstring status = L"Status: " + std::to_wstring(latchedCount) + L" latched | Configured keys: " +
+                          std::to_wstring(gState.bindings.size());
     SetWindowTextW(gState.statusLabel, status.c_str());
+    UpdateBindingsLabel();
 }
 
 void SendInputDownOrUp(const TargetInput& input, bool down) {
@@ -182,9 +222,9 @@ void StopRepeatTimer() {
     }
 }
 
-void StartRepeatTimer() {
-    if (gState.window != nullptr) {
-        SetTimer(gState.window, kRepeatTimerId, kInitialRepeatDelayMs, nullptr);
+void EnsureRepeatTimerRunning() {
+    if (gState.window != nullptr && AnyLatched()) {
+        SetTimer(gState.window, kRepeatTimerId, kRepeatPumpIntervalMs, nullptr);
     }
 }
 
@@ -200,17 +240,20 @@ void StopDetectMode(bool restoreButtonText) {
     }
 }
 
-void StopLatchedState() {
-    if (gState.keyLatched) {
-        SendInputDownOrUp(gState.target, false);
-        StopRepeatTimer();
-        gState.keyLatched = false;
+void StopAllLatchedState() {
+    for (auto& binding : gState.bindings) {
+        if (binding.keyLatched) {
+            SendInputDownOrUp(binding.target, false);
+        }
+
+        binding.keyLatched = false;
+        binding.hasFirstTap = false;
+        binding.releaseLatchedOnNextPhysicalUp = false;
+        binding.suppressPhysicalUntilUp = false;
+        binding.physicalInputIsDown = false;
     }
 
-    gState.hasFirstTap = false;
-    gState.releaseLatchedOnNextPhysicalUp = false;
-    gState.suppressPhysicalUntilUp = false;
-    gState.physicalInputIsDown = false;
+    StopRepeatTimer();
 }
 
 bool ParseInputToken(const std::wstring& rawText, TargetInput& outInput) {
@@ -291,14 +334,36 @@ bool ParseDoubleTapMs(UINT& outMs) {
     return true;
 }
 
-void ConfigureTarget(const TargetInput& target, UINT doubleTapMs) {
-    StopLatchedState();
-    gState.target = target;
-    gState.doubleTapMs = doubleTapMs;
+void UpsertBinding(const TargetInput& target, UINT doubleTapMs) {
+    const auto existing = std::find_if(gState.bindings.begin(),
+                                       gState.bindings.end(),
+                                       [&](const ToggleBinding& binding) { return InputsEqual(binding.target, target); });
+
+    if (existing != gState.bindings.end()) {
+        if (existing->keyLatched) {
+            SendInputDownOrUp(existing->target, false);
+        }
+
+        existing->doubleTapMs = doubleTapMs;
+        existing->keyLatched = false;
+        existing->hasFirstTap = false;
+        existing->releaseLatchedOnNextPhysicalUp = false;
+        existing->suppressPhysicalUntilUp = false;
+        existing->physicalInputIsDown = false;
+    } else {
+        ToggleBinding binding{};
+        binding.target = target;
+        binding.doubleTapMs = doubleTapMs;
+        gState.bindings.push_back(binding);
+    }
+
+    if (!AnyLatched()) {
+        StopRepeatTimer();
+    }
     UpdateStatus();
 }
 
-void ApplyConfiguredInput() {
+void AddConfiguredInput() {
     TargetInput parsedInput{};
     if (!ParseInputFromEdit(parsedInput)) {
         MessageBoxW(gState.window,
@@ -317,7 +382,7 @@ void ApplyConfiguredInput() {
         return;
     }
 
-    ConfigureTarget(parsedInput, parsedDoubleTapMs);
+    UpsertBinding(parsedInput, parsedDoubleTapMs);
 }
 
 void BeginDetectMode() {
@@ -340,15 +405,8 @@ void BeginDetectMode() {
 }
 
 void CaptureDetectedInput(const TargetInput& detected) {
-    wchar_t display[64]{};
     std::wstring inputName = InputToDisplay(detected);
     SetWindowTextW(gState.keyEdit, inputName.c_str());
-
-    UINT parsedDoubleTapMs = 0;
-    if (ParseDoubleTapMs(parsedDoubleTapMs)) {
-        ConfigureTarget(detected, parsedDoubleTapMs);
-    }
-
     StopDetectMode(true);
 }
 
@@ -360,11 +418,11 @@ bool IsInjectedMouse(const MSLLHOOKSTRUCT* data) {
     return (data->flags & LLMHF_INJECTED) != 0;
 }
 
-LRESULT HandleTargetPhysicalEvent(bool isDown, bool isUp) {
-    if (gState.suppressPhysicalUntilUp) {
+LRESULT HandleBindingPhysicalEvent(ToggleBinding& binding, bool isDown, bool isUp) {
+    if (binding.suppressPhysicalUntilUp) {
         if (isUp) {
-            gState.suppressPhysicalUntilUp = false;
-            gState.physicalInputIsDown = false;
+            binding.suppressPhysicalUntilUp = false;
+            binding.physicalInputIsDown = false;
             return 1;
         }
 
@@ -373,23 +431,25 @@ LRESULT HandleTargetPhysicalEvent(bool isDown, bool isUp) {
         }
     }
 
-    if (gState.keyLatched) {
+    if (binding.keyLatched) {
         if (isDown) {
-            if (!gState.physicalInputIsDown) {
-                gState.physicalInputIsDown = true;
-                gState.releaseLatchedOnNextPhysicalUp = true;
+            if (!binding.physicalInputIsDown) {
+                binding.physicalInputIsDown = true;
+                binding.releaseLatchedOnNextPhysicalUp = true;
             }
             return 1;
         }
 
         if (isUp) {
-            gState.physicalInputIsDown = false;
-            if (gState.releaseLatchedOnNextPhysicalUp) {
-                SendInputDownOrUp(gState.target, false);
-                StopRepeatTimer();
-                gState.keyLatched = false;
-                gState.releaseLatchedOnNextPhysicalUp = false;
-                gState.hasFirstTap = false;
+            binding.physicalInputIsDown = false;
+            if (binding.releaseLatchedOnNextPhysicalUp) {
+                SendInputDownOrUp(binding.target, false);
+                binding.keyLatched = false;
+                binding.releaseLatchedOnNextPhysicalUp = false;
+                binding.hasFirstTap = false;
+                if (!AnyLatched()) {
+                    StopRepeatTimer();
+                }
                 UpdateStatus();
             }
             return 1;
@@ -399,33 +459,34 @@ LRESULT HandleTargetPhysicalEvent(bool isDown, bool isUp) {
     }
 
     if (isUp) {
-        gState.physicalInputIsDown = false;
+        binding.physicalInputIsDown = false;
         return 0;
     }
 
     if (isDown) {
-        if (gState.physicalInputIsDown) {
+        if (binding.physicalInputIsDown) {
             return 0;
         }
 
-        gState.physicalInputIsDown = true;
+        binding.physicalInputIsDown = true;
         auto now = std::chrono::steady_clock::now();
-        if (gState.hasFirstTap) {
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - gState.lastPhysicalDown).count();
-            if (elapsedMs <= gState.doubleTapMs) {
-                SendInputDownOrUp(gState.target, true);
-                StartRepeatTimer();
-                gState.keyLatched = true;
-                gState.hasFirstTap = false;
-                gState.releaseLatchedOnNextPhysicalUp = false;
-                gState.suppressPhysicalUntilUp = true;
+        if (binding.hasFirstTap) {
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - binding.lastPhysicalDown).count();
+            if (elapsedMs <= binding.doubleTapMs) {
+                SendInputDownOrUp(binding.target, true);
+                binding.keyLatched = true;
+                binding.hasFirstTap = false;
+                binding.releaseLatchedOnNextPhysicalUp = false;
+                binding.suppressPhysicalUntilUp = true;
+                binding.nextRepeatAt = now + std::chrono::milliseconds(kInitialRepeatDelayMs);
+                EnsureRepeatTimerRunning();
                 UpdateStatus();
                 return 1;
             }
         }
 
-        gState.lastPhysicalDown = now;
-        gState.hasFirstTap = true;
+        binding.lastPhysicalDown = now;
+        binding.hasFirstTap = true;
     }
 
     return 0;
@@ -447,14 +508,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         return 1;
     }
 
-    if (gState.target.kind != InputKind::Keyboard || keyData->vkCode != gState.target.code) {
-        return CallNextHookEx(nullptr, code, wParam, lParam);
-    }
-
     const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
-    LRESULT handled = HandleTargetPhysicalEvent(isDown, isUp);
-    if (handled != 0) {
-        return handled;
+    for (auto& binding : gState.bindings) {
+        if (binding.target.kind != InputKind::Keyboard || keyData->vkCode != binding.target.code) {
+            continue;
+        }
+
+        LRESULT handled = HandleBindingPhysicalEvent(binding, isDown, isUp);
+        if (handled != 0) {
+            return handled;
+        }
     }
 
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -525,13 +588,15 @@ LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
         return 1;
     }
 
-    if (gState.target.kind != InputKind::MouseButton || mouseVk != gState.target.code) {
-        return CallNextHookEx(nullptr, code, wParam, lParam);
-    }
+    for (auto& binding : gState.bindings) {
+        if (binding.target.kind != InputKind::MouseButton || mouseVk != binding.target.code) {
+            continue;
+        }
 
-    LRESULT handled = HandleTargetPhysicalEvent(isDown, isUp);
-    if (handled != 0) {
-        return handled;
+        LRESULT handled = HandleBindingPhysicalEvent(binding, isDown, isUp);
+        if (handled != 0) {
+            return handled;
+        }
     }
 
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -595,14 +660,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 nullptr);
 
             CreateWindowW(L"BUTTON",
-                          L"Apply",
+                          L"Add New Key",
                           WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
                           490,
                           18,
-                          70,
+                          95,
                           24,
                           hwnd,
-                          reinterpret_cast<HMENU>(IDC_APPLY_BUTTON),
+                          reinterpret_cast<HMENU>(IDC_ADD_BUTTON),
                           gState.instance,
                           nullptr);
 
@@ -642,12 +707,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                gState.instance,
                                                nullptr);
 
+            gState.bindingsLabel = CreateWindowW(L"STATIC",
+                                                 L"",
+                                                 WS_VISIBLE | WS_CHILD,
+                                                 20,
+                                                 110,
+                                                 560,
+                                                 60,
+                                                 hwnd,
+                                                 reinterpret_cast<HMENU>(IDC_BINDINGS_LABEL),
+                                                 gState.instance,
+                                                 nullptr);
+
             CreateWindowW(L"STATIC",
-                          L"Behavior: double tap configured input to latch and auto-repeat; tap/hold once to release.\n"
-                          L"You can type names (SHIFT, ALT, MOUSE1) or click Detect and press once within 5 seconds.",
+                          L"Behavior: each configured key/button toggles independently; double tap to latch and auto-repeat,"
+                          L" then tap/hold once to release.\nUse Add New Key to append another key, or re-add to update its timing.",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          112,
+                          176,
                           560,
                           40,
                           hwnd,
@@ -660,8 +737,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_COMMAND: {
-            if (LOWORD(wParam) == IDC_APPLY_BUTTON) {
-                ApplyConfiguredInput();
+            if (LOWORD(wParam) == IDC_ADD_BUTTON) {
+                AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_DETECT_BUTTON) {
                 BeginDetectMode();
             }
@@ -670,15 +747,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             StopDetectMode(true);
-            StopLatchedState();
+            StopAllLatchedState();
             UninstallHooks();
             PostQuitMessage(0);
             return 0;
 
         case WM_TIMER:
-            if (wParam == kRepeatTimerId && gState.keyLatched) {
-                SendInputDownOrUp(gState.target, true);
-                SetTimer(gState.window, kRepeatTimerId, kRepeatIntervalMs, nullptr);
+            if (wParam == kRepeatTimerId) {
+                bool hasAnyLatched = false;
+                const auto now = std::chrono::steady_clock::now();
+                for (auto& binding : gState.bindings) {
+                    if (!binding.keyLatched) {
+                        continue;
+                    }
+
+                    hasAnyLatched = true;
+                    if (now >= binding.nextRepeatAt) {
+                        SendInputDownOrUp(binding.target, true);
+                        binding.nextRepeatAt = now + std::chrono::milliseconds(kRepeatIntervalMs);
+                    }
+                }
+
+                if (!hasAnyLatched) {
+                    StopRepeatTimer();
+                }
                 return 0;
             }
 
@@ -722,7 +814,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     620,
-                                    220,
+                                    270,
                                     nullptr,
                                     nullptr,
                                     hInstance,
