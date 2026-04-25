@@ -29,12 +29,10 @@ enum ControlId : int {
     IDC_KEY_LABEL = 1001,
     IDC_ADD_BUTTON = 1003,
     IDC_STATUS_LABEL = 1004,
-    IDC_TIPS_LABEL = 1005,
     IDC_DOUBLE_TAP_LABEL = 1006,
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_BINDINGS_LIST = 1008,
     IDC_REMOVE_BUTTON = 1009,
-    IDC_OVERLAY_CHECKBOX = 1010,
     IDC_OVERLAY_FONT_LABEL = 1011,
     IDC_OVERLAY_FONT_EDIT = 1012,
     IDC_OVERLAY_CORNER_LABEL = 1013,
@@ -87,7 +85,6 @@ struct AppState {
     HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
-    HWND overlayCheckbox{};
     HWND overlayFontEdit{};
     HWND overlayCornerCombo{};
     HWND overlayColorButton{};
@@ -976,37 +973,36 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 gState.instance,
                                                 nullptr);
 
-            gState.overlayCheckbox = CreateWindowW(L"BUTTON",
-                                                   L"Show overlay",
-                                                   WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-                                                   20,
-                                                   318,
-                                                   170,
-                                                   28,
-                                                   hwnd,
-                                                   reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
-                                                   gState.instance,
-                                                   nullptr);
-            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
-
             CreateWindowW(L"STATIC",
-                          L"Overlay font size:",
+                          L"Overlay Settings",
                           WS_VISIBLE | WS_CHILD,
-                          220,
-                          318,
-                          120,
+                          20,
+                          356,
+                          240,
                           28,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_OVERLAY_FONT_LABEL),
                           gState.instance,
                           nullptr);
 
+            CreateWindowW(L"STATIC",
+                          L"Font:",
+                          WS_VISIBLE | WS_CHILD,
+                          20,
+                          390,
+                          120,
+                          28,
+                          hwnd,
+                          nullptr,
+                          gState.instance,
+                          nullptr);
+
             gState.overlayFontEdit = CreateWindowW(L"EDIT",
                                                    L"16",
                                                    WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                                                   345,
-                                                   316,
-                                                   45,
+                                                   145,
+                                                   388,
+                                                   50,
                                                    30,
                                                    hwnd,
                                                    reinterpret_cast<HMENU>(IDC_OVERLAY_FONT_EDIT),
@@ -1014,11 +1010,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                    nullptr);
 
             CreateWindowW(L"STATIC",
-                          L"Overlay corner:",
+                          L"px",
                           WS_VISIBLE | WS_CHILD,
-                          420,
-                          318,
-                          110,
+                          205,
+                          390,
+                          35,
+                          28,
+                          hwnd,
+                          nullptr,
+                          gState.instance,
+                          nullptr);
+
+            CreateWindowW(L"STATIC",
+                          L"Location:",
+                          WS_VISIBLE | WS_CHILD,
+                          20,
+                          430,
+                          120,
                           28,
                           hwnd,
                           reinterpret_cast<HMENU>(IDC_OVERLAY_CORNER_LABEL),
@@ -1028,9 +1036,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.overlayCornerCombo = CreateWindowW(L"COMBOBOX",
                                                       L"",
                                                       WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
-                                                      535,
-                                                      316,
-                                                      115,
+                                                      145,
+                                                      428,
+                                                      140,
                                                       220,
                                                       hwnd,
                                                       reinterpret_cast<HMENU>(IDC_OVERLAY_CORNER_COMBO),
@@ -1041,11 +1049,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(gState.overlayCornerCombo, CB_SETCURSEL, 0, 0);
 
             gState.overlayColorButton = CreateWindowW(L"BUTTON",
-                                                      L"Overlay Color...",
+                                                      L"Select Color...",
                                                       WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-                                                      655,
-                                                      316,
-                                                      90,
+                                                      300,
+                                                      388,
+                                                      150,
                                                       30,
                                                       hwnd,
                                                       reinterpret_cast<HMENU>(IDC_OVERLAY_COLOR_BUTTON),
@@ -1053,10 +1061,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       nullptr);
 
             CreateWindowW(L"STATIC",
-                          L"Overlay monitor:",
+                          L"Monitor:",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          356,
+                          470,
                           120,
                           28,
                           hwnd,
@@ -1068,7 +1076,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                        L"",
                                                        WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST,
                                                        145,
-                                                       354,
+                                                       468,
                                                        340,
                                                        220,
                                                        hwnd,
@@ -1076,20 +1084,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                        gState.instance,
                                                        nullptr);
             RefreshMonitorList();
-
-            CreateWindowW(L"STATIC",
-                          L"Behavior: each configured key/button toggles independently; double tap to latch."
-                          L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
-                          L"Press Add New Key and then press one key/button within 5 seconds. Repeat Add New Key for each extra binding.",
-                          WS_VISIBLE | WS_CHILD,
-                          20,
-                          392,
-                          700,
-                          88,
-                          hwnd,
-                          reinterpret_cast<HMENU>(IDC_TIPS_LABEL),
-                          gState.instance,
-                          nullptr);
 
             TryEnableDarkTitleBar(hwnd);
 
@@ -1168,9 +1162,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
                 RemoveSelectedBinding();
-            } else if (LOWORD(wParam) == IDC_OVERLAY_CHECKBOX) {
-                gState.overlayEnabled = (SendMessageW(gState.overlayCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                SetOverlayVisible(gState.overlayEnabled);
             } else if (LOWORD(wParam) == IDC_OVERLAY_FONT_EDIT && HIWORD(wParam) == EN_CHANGE) {
                 ApplyOverlayFontSizeFromUi();
             } else if (LOWORD(wParam) == IDC_OVERLAY_COLOR_BUTTON) {
