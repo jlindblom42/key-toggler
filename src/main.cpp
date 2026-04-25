@@ -2,6 +2,7 @@
 #include <dwmapi.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <array>
@@ -81,6 +82,7 @@ struct MonitorEntry {
     HMONITOR handle{};
     RECT bounds{};
     std::wstring label{};
+    std::wstring deviceName{};
     bool isPrimary = false;
 };
 
@@ -107,9 +109,12 @@ struct AppState {
 
     bool isAwaitingNewBinding = false;
     bool overlayEnabled = true;
+    UINT defaultDoubleTapMs = kDefaultDoubleTapMs;
     int overlayFontSizePx = 16;
     OverlayCorner overlayCorner = OverlayCorner::TopLeft;
     COLORREF overlayTextColor = RGB(244, 244, 245);
+    std::wstring overlayMonitorDeviceName{};
+    bool pendingMonitorSelectionRestore = false;
     std::vector<MonitorEntry> monitors{};
     NOTIFYICONDATAW trayIconData{};
     bool trayIconVisible = false;
@@ -140,6 +145,108 @@ void SetOverlayVisible(bool visible);
 void UpdateOverlay();
 void RepositionOverlayWindow();
 void UpdateRemoveButtonEnabled();
+void SaveConfiguration();
+
+std::wstring GetConfigPath() {
+    wchar_t appDataPath[MAX_PATH]{};
+    if (SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath) != S_OK) {
+        return L".\\key-toggler.ini";
+    }
+
+    std::wstring configDir = std::wstring(appDataPath) + L"\\KeyToggler";
+    CreateDirectoryW(configDir.c_str(), nullptr);
+    return configDir + L"\\config.ini";
+}
+
+UINT ReadConfigUInt(const std::wstring& path, const wchar_t* section, const wchar_t* key, UINT defaultValue) {
+    return static_cast<UINT>(GetPrivateProfileIntW(section, key, static_cast<int>(defaultValue), path.c_str()));
+}
+
+std::wstring ReadConfigString(
+    const std::wstring& path, const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue = L"") {
+    wchar_t buffer[256]{};
+    GetPrivateProfileStringW(section, key, defaultValue, buffer, static_cast<DWORD>(std::size(buffer)), path.c_str());
+    return buffer;
+}
+
+void LoadConfiguration() {
+    const std::wstring path = GetConfigPath();
+    gState.defaultDoubleTapMs = ReadConfigUInt(path, L"General", L"DefaultDoubleTapMs", kDefaultDoubleTapMs);
+    if (gState.defaultDoubleTapMs < kMinDoubleTapMs || gState.defaultDoubleTapMs > kMaxDoubleTapMs) {
+        gState.defaultDoubleTapMs = kDefaultDoubleTapMs;
+    }
+
+    gState.overlayEnabled = ReadConfigUInt(path, L"General", L"OverlayEnabled", 1) != 0;
+    gState.minimizeToTrayEnabled = ReadConfigUInt(path, L"General", L"MinimizeToTray", 1) != 0;
+    gState.overlayFontSizePx = static_cast<int>(ReadConfigUInt(path, L"General", L"OverlayFontSizePx", 16));
+    gState.overlayFontSizePx = std::clamp(gState.overlayFontSizePx, kMinOverlayFontSizePx, kMaxOverlayFontSizePx);
+    gState.overlayCorner =
+        ReadConfigUInt(path, L"General", L"OverlayCorner", 0) == 1 ? OverlayCorner::TopRight : OverlayCorner::TopLeft;
+    gState.overlayTextColor = static_cast<COLORREF>(ReadConfigUInt(path, L"General", L"OverlayTextColor", kDarkTextColor));
+    gState.overlayMonitorDeviceName = ReadConfigString(path, L"General", L"OverlayMonitorDeviceName", L"");
+    gState.pendingMonitorSelectionRestore = !gState.overlayMonitorDeviceName.empty();
+
+    gState.bindings.clear();
+    const UINT bindingCount = ReadConfigUInt(path, L"Bindings", L"Count", 0);
+    for (UINT i = 0; i < bindingCount; ++i) {
+        std::wstring keyName = L"Binding" + std::to_wstring(i);
+        std::wstring value = ReadConfigString(path, L"Bindings", keyName.c_str(), L"");
+        if (value.empty()) {
+            continue;
+        }
+
+        unsigned int kind = 0;
+        unsigned int code = 0;
+        unsigned int doubleTapMs = kDefaultDoubleTapMs;
+        if (swscanf(value.c_str(), L"%u:%u:%u", &kind, &code, &doubleTapMs) != 3) {
+            continue;
+        }
+
+        if (doubleTapMs < kMinDoubleTapMs || doubleTapMs > kMaxDoubleTapMs) {
+            continue;
+        }
+
+        if (kind > 1 || code > 0xFFFF) {
+            continue;
+        }
+
+        ToggleBinding binding{};
+        binding.target.kind = (kind == 0) ? InputKind::Keyboard : InputKind::MouseButton;
+        binding.target.code = code;
+        binding.doubleTapMs = doubleTapMs;
+        gState.bindings.push_back(binding);
+    }
+}
+
+void SaveConfiguration() {
+    const std::wstring path = GetConfigPath();
+    WritePrivateProfileStringW(
+        L"General", L"DefaultDoubleTapMs", std::to_wstring(gState.defaultDoubleTapMs).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"General", L"OverlayEnabled", gState.overlayEnabled ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"General",
+                               L"MinimizeToTray",
+                               gState.minimizeToTrayEnabled ? L"1" : L"0",
+                               path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayFontSizePx", std::to_wstring(gState.overlayFontSizePx).c_str(), path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayCorner", gState.overlayCorner == OverlayCorner::TopRight ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayTextColor", std::to_wstring(static_cast<unsigned int>(gState.overlayTextColor)).c_str(), path.c_str());
+    WritePrivateProfileStringW(
+        L"General", L"OverlayMonitorDeviceName", gState.overlayMonitorDeviceName.c_str(), path.c_str());
+
+    WritePrivateProfileSectionW(L"Bindings", L"", path.c_str());
+    WritePrivateProfileStringW(L"Bindings", L"Count", std::to_wstring(gState.bindings.size()).c_str(), path.c_str());
+    for (size_t i = 0; i < gState.bindings.size(); ++i) {
+        const ToggleBinding& binding = gState.bindings[i];
+        std::wstring keyName = L"Binding" + std::to_wstring(i);
+        const unsigned int kind = binding.target.kind == InputKind::Keyboard ? 0U : 1U;
+        std::wstring value = std::to_wstring(kind) + L":" + std::to_wstring(binding.target.code) + L":" +
+                             std::to_wstring(binding.doubleTapMs);
+        WritePrivateProfileStringW(L"Bindings", keyName.c_str(), value.c_str(), path.c_str());
+    }
+}
 
 void ShowTrayIcon() {
     if (gState.window == nullptr || gState.trayIconVisible) {
@@ -359,6 +466,7 @@ BOOL CALLBACK CollectMonitorProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) 
     entry.handle = hMonitor;
     entry.bounds = info.rcMonitor;
     entry.isPrimary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    entry.deviceName = info.szDevice;
     entry.label = info.szDevice;
     if (entry.isPrimary) {
         entry.label += L" (Primary)";
@@ -389,6 +497,15 @@ void RefreshMonitorList() {
         LRESULT selectionToApply = 0;
         if (previousSelection >= 0 && static_cast<size_t>(previousSelection) < gState.monitors.size()) {
             selectionToApply = previousSelection;
+        } else if (gState.pendingMonitorSelectionRestore) {
+            const auto savedIt =
+                std::find_if(gState.monitors.begin(), gState.monitors.end(), [](const MonitorEntry& monitor) {
+                    return monitor.deviceName == gState.overlayMonitorDeviceName;
+                });
+            if (savedIt != gState.monitors.end()) {
+                selectionToApply = static_cast<LRESULT>(std::distance(gState.monitors.begin(), savedIt));
+            }
+            gState.pendingMonitorSelectionRestore = false;
         } else {
             const auto primaryIt = std::find_if(
                 gState.monitors.begin(), gState.monitors.end(), [](const MonitorEntry& monitor) { return monitor.isPrimary; });
@@ -397,6 +514,9 @@ void RefreshMonitorList() {
             }
         }
         SendMessageW(gState.overlayMonitorCombo, CB_SETCURSEL, selectionToApply, 0);
+        if (selectionToApply >= 0 && static_cast<size_t>(selectionToApply) < gState.monitors.size()) {
+            gState.overlayMonitorDeviceName = gState.monitors[static_cast<size_t>(selectionToApply)].deviceName;
+        }
     }
 }
 
@@ -623,6 +743,7 @@ void UpsertBinding(const TargetInput& target, UINT doubleTapMs) {
         binding.doubleTapMs = doubleTapMs;
         gState.bindings.push_back(binding);
     }
+    gState.defaultDoubleTapMs = doubleTapMs;
 
     if (!AnyLatched()) {
         StopRepeatTimer();
@@ -979,7 +1100,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                           reinterpret_cast<HMENU>(IDC_MINIMIZE_TO_TRAY_CHECKBOX),
                                                           gState.instance,
                                                           nullptr);
-            SendMessageW(gState.minimizeToTrayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(gState.minimizeToTrayCheckbox,
+                         BM_SETCHECK,
+                         gState.minimizeToTrayEnabled ? BST_CHECKED : BST_UNCHECKED,
+                         0);
 
             CreateWindowW(L"STATIC",
                           L"Toggle input (key or mouse button):",
@@ -1018,7 +1142,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           nullptr);
 
             gState.doubleTapEdit = CreateWindowW(L"EDIT",
-                                                 L"300",
+                                                 std::to_wstring(gState.defaultDoubleTapMs).c_str(),
                                                  WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                                  245,
                                                  98,
@@ -1088,7 +1212,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                    reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
                                                    gState.instance,
                                                    nullptr);
-            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(
+                gState.overlayCheckbox, BM_SETCHECK, gState.overlayEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
             CreateWindowW(L"STATIC",
                           L"Font:",
@@ -1103,7 +1228,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           nullptr);
 
             gState.overlayFontEdit = CreateWindowW(L"EDIT",
-                                                   L"16",
+                                                   std::to_wstring(gState.overlayFontSizePx).c_str(),
                                                    WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                                                    145,
                                                    462,
@@ -1163,7 +1288,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                       nullptr);
             SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-left"));
             SendMessageW(gState.overlayCornerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Top-right"));
-            SendMessageW(gState.overlayCornerCombo, CB_SETCURSEL, 0, 0);
+            SendMessageW(gState.overlayCornerCombo,
+                         CB_SETCURSEL,
+                         gState.overlayCorner == OverlayCorner::TopRight ? 1 : 0,
+                         0);
 
             gState.overlayColorButton = CreateWindowW(L"BUTTON",
                                                       L"Select Color...",
@@ -1303,6 +1431,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_DROPDOWN) {
                 RefreshMonitorList();
             } else if (LOWORD(wParam) == IDC_OVERLAY_MONITOR_COMBO && HIWORD(wParam) == CBN_SELCHANGE) {
+                LRESULT selected = SendMessageW(gState.overlayMonitorCombo, CB_GETCURSEL, 0, 0);
+                if (selected >= 0 && static_cast<size_t>(selected) < gState.monitors.size()) {
+                    gState.overlayMonitorDeviceName = gState.monitors[static_cast<size_t>(selected)].deviceName;
+                }
                 RepositionOverlayWindow();
             } else if (LOWORD(wParam) == IDC_MINIMIZE_TO_TRAY_CHECKBOX) {
                 gState.minimizeToTrayEnabled =
@@ -1327,6 +1459,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_DESTROY:
+            SaveConfiguration();
             StopDetectMode(true);
             StopAllLatchedState();
             UninstallHooks();
@@ -1417,6 +1550,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     gState.instance = hInstance;
+    LoadConfiguration();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
