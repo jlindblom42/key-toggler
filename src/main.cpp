@@ -22,6 +22,7 @@ constexpr UINT kDetectCountdownMs = 1000;
 constexpr int kDetectTimeoutSeconds = 5;
 constexpr ULONG_PTR kSyntheticInputTag = 0x4B545447;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
+constexpr wchar_t kOverlayWindowClassName[] = L"KeyTogglerOverlayWindow";
 
 enum ControlId : int {
     IDC_KEY_LABEL = 1001,
@@ -32,6 +33,7 @@ enum ControlId : int {
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_BINDINGS_LIST = 1008,
     IDC_REMOVE_BUTTON = 1009,
+    IDC_OVERLAY_CHECKBOX = 1010,
 };
 
 enum class InputKind {
@@ -66,11 +68,14 @@ struct AppState {
     HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
+    HWND overlayCheckbox{};
+    HWND overlayWindow{};
     HFONT uiFont{};
     HBRUSH backgroundBrush{};
     HBRUSH controlBrush{};
 
     bool isAwaitingNewBinding = false;
+    bool overlayEnabled = true;
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -158,6 +163,45 @@ bool AnyLatched() {
                        [](const ToggleBinding& binding) { return binding.keyLatched; });
 }
 
+std::wstring BuildOverlayText() {
+    std::wstring text = L"Key Toggler\n";
+    if (gState.bindings.empty()) {
+        text += L"No configured bindings";
+        return text;
+    }
+
+    for (const auto& binding : gState.bindings) {
+        text += binding.keyLatched ? L"[ON] " : L"[OFF] ";
+        text += InputToDisplay(binding.target);
+        text += L"\n";
+    }
+
+    if (!text.empty() && text.back() == L'\n') {
+        text.pop_back();
+    }
+    return text;
+}
+
+void SetOverlayVisible(bool visible) {
+    if (gState.overlayWindow == nullptr) {
+        return;
+    }
+    ShowWindow(gState.overlayWindow, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
+void UpdateOverlay() {
+    if (gState.overlayWindow == nullptr) {
+        return;
+    }
+
+    std::wstring text = BuildOverlayText();
+    SetWindowTextW(gState.overlayWindow, text.c_str());
+    if (gState.overlayEnabled) {
+        SetOverlayVisible(true);
+    }
+    InvalidateRect(gState.overlayWindow, nullptr, TRUE);
+}
+
 void UpdateBindingsLabel() {
     if (gState.bindingsList == nullptr) {
         return;
@@ -185,6 +229,7 @@ void UpdateStatus() {
                           std::to_wstring(gState.bindings.size());
     SetWindowTextW(gState.statusLabel, status.c_str());
     UpdateBindingsLabel();
+    UpdateOverlay();
 }
 
 void SendInputDownOrUp(const TargetInput& input, bool down) {
@@ -607,6 +652,47 @@ void TryEnableDarkTitleBar(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enableDarkMode, sizeof(enableDarkMode));
 }
 
+LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            HBRUSH background = CreateSolidBrush(RGB(15, 23, 42));
+            FillRect(dc, &client, background);
+            DeleteObject(background);
+
+            FrameRect(dc, &client, reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, kDarkTextColor);
+            if (gState.uiFont != nullptr) {
+                SelectObject(dc, gState.uiFont);
+            }
+
+            wchar_t text[2048]{};
+            GetWindowTextW(hwnd, text, static_cast<int>(std::size(text)));
+            RECT textRect = client;
+            textRect.left += 10;
+            textRect.top += 8;
+            textRect.right -= 10;
+            textRect.bottom -= 8;
+            DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -703,6 +789,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 gState.instance,
                                                 nullptr);
 
+            gState.overlayCheckbox = CreateWindowW(L"BUTTON",
+                                                   L"Show top-left overlay",
+                                                   WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                                                   220,
+                                                   318,
+                                                   240,
+                                                   28,
+                                                   hwnd,
+                                                   reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
+                                                   gState.instance,
+                                                   nullptr);
+            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+
             CreateWindowW(L"STATIC",
                           L"Behavior: each configured key/button toggles independently; double tap to latch."
                           L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
@@ -724,6 +823,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ApplyUiFont(currentControl);
                 currentControl = GetWindow(currentControl, GW_HWNDNEXT);
             }
+
+            gState.overlayWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                                   kOverlayWindowClassName,
+                                                   L"",
+                                                   WS_POPUP,
+                                                   10,
+                                                   10,
+                                                   280,
+                                                   240,
+                                                   nullptr,
+                                                   nullptr,
+                                                   gState.instance,
+                                                   nullptr);
+            UpdateOverlay();
+            SetOverlayVisible(gState.overlayEnabled);
 
             SetAwaitingNewBinding(false);
             UpdateStatus();
@@ -772,6 +886,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
                 RemoveSelectedBinding();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_CHECKBOX) {
+                gState.overlayEnabled = (SendMessageW(gState.overlayCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                SetOverlayVisible(gState.overlayEnabled);
             }
             return 0;
         }
@@ -780,6 +897,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StopDetectMode(true);
             StopAllLatchedState();
             UninstallHooks();
+            if (gState.overlayWindow != nullptr) {
+                DestroyWindow(gState.overlayWindow);
+                gState.overlayWindow = nullptr;
+            }
             if (gState.uiFont != nullptr) {
                 DeleteObject(gState.uiFont);
                 gState.uiFont = nullptr;
@@ -867,6 +988,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) {
         MessageBoxW(nullptr, L"Failed to register window class.", L"Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    WNDCLASSW overlayWc{};
+    overlayWc.lpfnWndProc = OverlayWindowProc;
+    overlayWc.hInstance = hInstance;
+    overlayWc.lpszClassName = kOverlayWindowClassName;
+    overlayWc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    overlayWc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    if (!RegisterClassW(&overlayWc)) {
+        MessageBoxW(nullptr, L"Failed to register overlay window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
