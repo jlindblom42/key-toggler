@@ -147,6 +147,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             if (elapsedMs <= kDoubleTapMs) {
                 SendVirtualKey(gState.targetVk, true);
                 gState.keyLatched = true;
+                gState.ignoreNextPhysicalUp = true;
                 gState.hasFirstTap = false;
                 UpdateStatus();
                 return 1;
