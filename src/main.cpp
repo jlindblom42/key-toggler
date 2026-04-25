@@ -103,6 +103,9 @@ constexpr COLORREF kOverlayTransparentColorKey = RGB(255, 0, 255);
 constexpr int kMinOverlayFontSizePx = 10;
 constexpr int kMaxOverlayFontSizePx = 48;
 
+void SetOverlayVisible(bool visible);
+void UpdateOverlay();
+
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
         return L"SHIFT";
