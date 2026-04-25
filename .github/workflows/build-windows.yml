@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - release
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Increment patch version
+      - name: Increment version
         id: version
         shell: pwsh
         run: |
@@ -31,7 +32,14 @@ jobs:
 
           $major = [int]$Matches[1]
           $minor = [int]$Matches[2]
-          $patch = [int]$Matches[3] + 1
+          $patch = [int]$Matches[3]
+
+          if ("${{ github.ref_name }}" -eq "release") {
+            $minor += 1
+            $patch = 0
+          } else {
+            $patch += 1
+          }
 
           $newVersion = "$major.$minor.$patch"
           Set-Content -Path VERSION -Value $newVersion
@@ -62,6 +70,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub release and upload executable
+        if: github.ref_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
