@@ -19,6 +19,7 @@ constexpr UINT kRepeatIntervalMs = 33;
 constexpr UINT kRepeatPumpIntervalMs = 10;
 constexpr UINT kDetectCountdownMs = 1000;
 constexpr int kDetectTimeoutSeconds = 5;
+constexpr ULONG_PTR kSyntheticInputTag = 0x4B545447;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
 
 enum ControlId : int {
@@ -90,6 +91,12 @@ std::wstring KeyboardVkToDisplay(UINT vk) {
     }
     if (vk == VK_CONTROL) {
         return L"CTRL";
+    }
+    if (vk == VK_BROWSER_BACK) {
+        return L"BROWSER BACK";
+    }
+    if (vk == VK_BROWSER_FORWARD) {
+        return L"BROWSER FORWARD";
     }
 
     UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -197,6 +204,12 @@ void SendInputDownOrUp(const TargetInput& input, bool down) {
             default:
                 return;
         }
+    }
+
+    if (input.kind == InputKind::Keyboard) {
+        nativeInput.ki.dwExtraInfo = kSyntheticInputTag;
+    } else {
+        nativeInput.mi.dwExtraInfo = kSyntheticInputTag;
     }
 
     SendInput(1, &nativeInput, sizeof(INPUT));
@@ -375,12 +388,12 @@ void CaptureDetectedInput(const TargetInput& detected) {
     SetAwaitingNewBinding(false);
 }
 
-bool IsInjectedKeyboard(const KBDLLHOOKSTRUCT* data) {
-    return (data->flags & LLKHF_INJECTED) != 0;
+bool IsSyntheticKeyboard(const KBDLLHOOKSTRUCT* data) {
+    return (data->flags & LLKHF_INJECTED) != 0 && data->dwExtraInfo == kSyntheticInputTag;
 }
 
-bool IsInjectedMouse(const MSLLHOOKSTRUCT* data) {
-    return (data->flags & LLMHF_INJECTED) != 0;
+bool IsSyntheticMouse(const MSLLHOOKSTRUCT* data) {
+    return (data->flags & LLMHF_INJECTED) != 0 && data->dwExtraInfo == kSyntheticInputTag;
 }
 
 LRESULT HandleBindingPhysicalEvent(ToggleBinding& binding, bool isDown, bool isUp) {
@@ -463,7 +476,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     const auto* keyData = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-    if (IsInjectedKeyboard(keyData)) {
+    if (IsSyntheticKeyboard(keyData)) {
         return CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
@@ -537,7 +550,7 @@ LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     const auto* mouseData = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-    if (IsInjectedMouse(mouseData)) {
+    if (IsSyntheticMouse(mouseData)) {
         return CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
