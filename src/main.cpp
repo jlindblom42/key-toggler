@@ -22,6 +22,7 @@ constexpr UINT kDetectCountdownMs = 1000;
 constexpr int kDetectTimeoutSeconds = 5;
 constexpr ULONG_PTR kSyntheticInputTag = 0x4B545447;
 constexpr wchar_t kWindowClassName[] = L"KeyTogglerWindow";
+constexpr wchar_t kOverlayWindowClassName[] = L"KeyTogglerOverlayWindow";
 
 enum ControlId : int {
     IDC_KEY_LABEL = 1001,
@@ -32,6 +33,9 @@ enum ControlId : int {
     IDC_DOUBLE_TAP_EDIT = 1007,
     IDC_BINDINGS_LIST = 1008,
     IDC_REMOVE_BUTTON = 1009,
+    IDC_OVERLAY_CHECKBOX = 1010,
+    IDC_OVERLAY_FONT_LABEL = 1011,
+    IDC_OVERLAY_FONT_EDIT = 1012,
 };
 
 enum class InputKind {
@@ -66,11 +70,17 @@ struct AppState {
     HWND addButton{};
     HWND bindingsList{};
     HWND removeButton{};
+    HWND overlayCheckbox{};
+    HWND overlayFontEdit{};
+    HWND overlayWindow{};
     HFONT uiFont{};
+    HFONT overlayFont{};
     HBRUSH backgroundBrush{};
     HBRUSH controlBrush{};
 
     bool isAwaitingNewBinding = false;
+    bool overlayEnabled = true;
+    int overlayFontSizePx = 16;
 
     HHOOK keyboardHook{};
     HHOOK mouseHook{};
@@ -89,6 +99,12 @@ constexpr COLORREF kDarkTextColor = RGB(244, 244, 245);
 constexpr COLORREF kDarkButtonColor = RGB(63, 63, 70);
 constexpr COLORREF kDarkButtonHoverColor = RGB(82, 82, 91);
 constexpr COLORREF kDarkButtonDisabledColor = RGB(51, 51, 56);
+constexpr COLORREF kOverlayTransparentColorKey = RGB(255, 0, 255);
+constexpr int kMinOverlayFontSizePx = 10;
+constexpr int kMaxOverlayFontSizePx = 48;
+
+void SetOverlayVisible(bool visible);
+void UpdateOverlay();
 
 std::wstring KeyboardVkToDisplay(UINT vk) {
     if (vk == VK_SHIFT) {
@@ -158,6 +174,97 @@ bool AnyLatched() {
                        [](const ToggleBinding& binding) { return binding.keyLatched; });
 }
 
+std::wstring BuildOverlayText() {
+    std::wstring text = L"Key Toggler\n";
+    if (gState.bindings.empty()) {
+        text += L"No configured bindings";
+        return text;
+    }
+
+    for (const auto& binding : gState.bindings) {
+        text += binding.keyLatched ? L"[ON] " : L"[OFF] ";
+        text += InputToDisplay(binding.target);
+        text += L"\n";
+    }
+
+    if (!text.empty() && text.back() == L'\n') {
+        text.pop_back();
+    }
+    return text;
+}
+
+void RebuildOverlayFont() {
+    if (gState.overlayFont != nullptr) {
+        DeleteObject(gState.overlayFont);
+        gState.overlayFont = nullptr;
+    }
+
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        return;
+    }
+
+    metrics.lfMessageFont.lfHeight = -gState.overlayFontSizePx;
+    metrics.lfMessageFont.lfWeight = FW_NORMAL;
+    gState.overlayFont = CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+bool ParseOverlayFontSize(int& outSize) {
+    if (gState.overlayFontEdit == nullptr) {
+        return false;
+    }
+
+    wchar_t text[16]{};
+    GetWindowTextW(gState.overlayFontEdit, text, static_cast<int>(std::size(text)));
+    if (text[0] == L'\0') {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    long value = std::wcstol(text, &end, 10);
+    if (end == text || *end != L'\0') {
+        return false;
+    }
+    if (value < kMinOverlayFontSizePx || value > kMaxOverlayFontSizePx) {
+        return false;
+    }
+
+    outSize = static_cast<int>(value);
+    return true;
+}
+
+void ApplyOverlayFontSizeFromUi() {
+    int parsedSize = 0;
+    if (!ParseOverlayFontSize(parsedSize) || parsedSize == gState.overlayFontSizePx) {
+        return;
+    }
+
+    gState.overlayFontSizePx = parsedSize;
+    RebuildOverlayFont();
+    UpdateOverlay();
+}
+
+void SetOverlayVisible(bool visible) {
+    if (gState.overlayWindow == nullptr) {
+        return;
+    }
+    ShowWindow(gState.overlayWindow, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
+void UpdateOverlay() {
+    if (gState.overlayWindow == nullptr) {
+        return;
+    }
+
+    std::wstring text = BuildOverlayText();
+    SetWindowTextW(gState.overlayWindow, text.c_str());
+    if (gState.overlayEnabled) {
+        SetOverlayVisible(true);
+    }
+    InvalidateRect(gState.overlayWindow, nullptr, TRUE);
+}
+
 void UpdateBindingsLabel() {
     if (gState.bindingsList == nullptr) {
         return;
@@ -185,6 +292,7 @@ void UpdateStatus() {
                           std::to_wstring(gState.bindings.size());
     SetWindowTextW(gState.statusLabel, status.c_str());
     UpdateBindingsLabel();
+    UpdateOverlay();
 }
 
 void SendInputDownOrUp(const TargetInput& input, bool down) {
@@ -607,6 +715,47 @@ void TryEnableDarkTitleBar(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &enableDarkMode, sizeof(enableDarkMode));
 }
 
+LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            HBRUSH background = CreateSolidBrush(kOverlayTransparentColorKey);
+            FillRect(dc, &client, background);
+            DeleteObject(background);
+
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, kDarkTextColor);
+            if (gState.overlayFont != nullptr) {
+                SelectObject(dc, gState.overlayFont);
+            } else if (gState.uiFont != nullptr) {
+                SelectObject(dc, gState.uiFont);
+            }
+
+            wchar_t text[2048]{};
+            GetWindowTextW(hwnd, text, static_cast<int>(std::size(text)));
+            RECT textRect = client;
+            textRect.left += 8;
+            textRect.top += 8;
+            textRect.right -= 8;
+            textRect.bottom -= 8;
+            DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -703,6 +852,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                 gState.instance,
                                                 nullptr);
 
+            gState.overlayCheckbox = CreateWindowW(L"BUTTON",
+                                                   L"Show top-left overlay",
+                                                   WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+                                                   220,
+                                                   318,
+                                                   240,
+                                                   28,
+                                                   hwnd,
+                                                   reinterpret_cast<HMENU>(IDC_OVERLAY_CHECKBOX),
+                                                   gState.instance,
+                                                   nullptr);
+            SendMessageW(gState.overlayCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+
+            CreateWindowW(L"STATIC",
+                          L"Overlay font size:",
+                          WS_VISIBLE | WS_CHILD,
+                          480,
+                          318,
+                          150,
+                          28,
+                          hwnd,
+                          reinterpret_cast<HMENU>(IDC_OVERLAY_FONT_LABEL),
+                          gState.instance,
+                          nullptr);
+
+            gState.overlayFontEdit = CreateWindowW(L"EDIT",
+                                                   L"16",
+                                                   WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+                                                   635,
+                                                   316,
+                                                   45,
+                                                   30,
+                                                   hwnd,
+                                                   reinterpret_cast<HMENU>(IDC_OVERLAY_FONT_EDIT),
+                                                   gState.instance,
+                                                   nullptr);
+
             CreateWindowW(L"STATIC",
                           L"Behavior: each configured key/button toggles independently; double tap to latch."
                           L" Keys auto-repeat while latched, mouse buttons stay held down until released.\n"
@@ -724,6 +910,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ApplyUiFont(currentControl);
                 currentControl = GetWindow(currentControl, GW_HWNDNEXT);
             }
+
+            RebuildOverlayFont();
+
+            gState.overlayWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED |
+                                                       WS_EX_TRANSPARENT,
+                                                   kOverlayWindowClassName,
+                                                   L"",
+                                                   WS_POPUP,
+                                                   10,
+                                                   10,
+                                                   280,
+                                                   240,
+                                                   nullptr,
+                                                   nullptr,
+                                                   gState.instance,
+                                                   nullptr);
+            if (gState.overlayWindow != nullptr) {
+                SetLayeredWindowAttributes(gState.overlayWindow, kOverlayTransparentColorKey, 0, LWA_COLORKEY);
+            }
+            UpdateOverlay();
+            SetOverlayVisible(gState.overlayEnabled);
 
             SetAwaitingNewBinding(false);
             UpdateStatus();
@@ -772,6 +979,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AddConfiguredInput();
             } else if (LOWORD(wParam) == IDC_REMOVE_BUTTON) {
                 RemoveSelectedBinding();
+            } else if (LOWORD(wParam) == IDC_OVERLAY_CHECKBOX) {
+                gState.overlayEnabled = (SendMessageW(gState.overlayCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                SetOverlayVisible(gState.overlayEnabled);
+            } else if (LOWORD(wParam) == IDC_OVERLAY_FONT_EDIT && HIWORD(wParam) == EN_CHANGE) {
+                ApplyOverlayFontSizeFromUi();
             }
             return 0;
         }
@@ -780,9 +992,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StopDetectMode(true);
             StopAllLatchedState();
             UninstallHooks();
+            if (gState.overlayWindow != nullptr) {
+                DestroyWindow(gState.overlayWindow);
+                gState.overlayWindow = nullptr;
+            }
             if (gState.uiFont != nullptr) {
                 DeleteObject(gState.uiFont);
                 gState.uiFont = nullptr;
+            }
+            if (gState.overlayFont != nullptr) {
+                DeleteObject(gState.overlayFont);
+                gState.overlayFont = nullptr;
             }
             if (gState.backgroundBrush != nullptr) {
                 DeleteObject(gState.backgroundBrush);
@@ -867,6 +1087,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) {
         MessageBoxW(nullptr, L"Failed to register window class.", L"Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    WNDCLASSW overlayWc{};
+    overlayWc.lpfnWndProc = OverlayWindowProc;
+    overlayWc.hInstance = hInstance;
+    overlayWc.lpszClassName = kOverlayWindowClassName;
+    overlayWc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    overlayWc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    if (!RegisterClassW(&overlayWc)) {
+        MessageBoxW(nullptr, L"Failed to register overlay window class.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
