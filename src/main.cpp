@@ -2,12 +2,15 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cwctype>
 #include <string>
 
 namespace {
 
-constexpr int kDoubleTapMs = 300;
+constexpr UINT kDefaultDoubleTapMs = 300;
+constexpr UINT kMinDoubleTapMs = 50;
+constexpr UINT kMaxDoubleTapMs = 2000;
 constexpr UINT_PTR kRepeatTimerId = 1;
 constexpr UINT kInitialRepeatDelayMs = 400;
 constexpr UINT kRepeatIntervalMs = 33;
@@ -19,19 +22,24 @@ enum ControlId : int {
     IDC_APPLY_BUTTON = 1003,
     IDC_STATUS_LABEL = 1004,
     IDC_TIPS_LABEL = 1005,
+    IDC_DOUBLE_TAP_LABEL = 1006,
+    IDC_DOUBLE_TAP_EDIT = 1007,
 };
 
 struct AppState {
     HINSTANCE instance{};
     HWND window{};
     HWND keyEdit{};
+    HWND doubleTapEdit{};
     HWND statusLabel{};
 
     HHOOK keyboardHook{};
 
     UINT targetVk = 'T';
+    UINT doubleTapMs = kDefaultDoubleTapMs;
     bool keyLatched = false;
-    bool ignoreNextPhysicalUp = false;
+    bool suppressPhysicalUntilUp = false;
+    bool physicalKeyIsDown = false;
     std::chrono::steady_clock::time_point lastPhysicalDown{};
 
     bool hasFirstTap = false;
@@ -57,7 +65,8 @@ std::wstring VkToDisplay(UINT vk) {
 
 void UpdateStatus() {
     std::wstring status = L"Status: " + std::wstring(gState.keyLatched ? L"Latched" : L"Not latched") +
-                          L" | Configured key: " + VkToDisplay(gState.targetVk);
+                          L" | Configured key: " + VkToDisplay(gState.targetVk) +
+                          L" | Double tap window: " + std::to_wstring(gState.doubleTapMs) + L" ms";
     SetWindowTextW(gState.statusLabel, status.c_str());
 }
 
@@ -100,12 +109,42 @@ UINT ParseKeyFromEdit() {
     return LOBYTE(vk);
 }
 
+bool ParseDoubleTapMs(UINT& outMs) {
+    wchar_t text[32]{};
+    GetWindowTextW(gState.doubleTapEdit, text, static_cast<int>(std::size(text)));
+    if (text[0] == L'\0') {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    unsigned long value = std::wcstoul(text, &end, 10);
+    if (end == text || *end != L'\0') {
+        return false;
+    }
+
+    if (value < kMinDoubleTapMs || value > kMaxDoubleTapMs) {
+        return false;
+    }
+
+    outMs = static_cast<UINT>(value);
+    return true;
+}
+
 void ApplyConfiguredKey() {
     UINT parsed = ParseKeyFromEdit();
     if (parsed == 0) {
         MessageBoxW(gState.window,
                     L"Please enter a valid single key (for example: T, F, 1).",
                     L"Invalid key",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    UINT parsedDoubleTapMs = 0;
+    if (!ParseDoubleTapMs(parsedDoubleTapMs)) {
+        MessageBoxW(gState.window,
+                    L"Please enter a valid double-tap window in milliseconds (50-2000).",
+                    L"Invalid double-tap window",
                     MB_OK | MB_ICONWARNING);
         return;
     }
@@ -117,7 +156,10 @@ void ApplyConfiguredKey() {
     }
 
     gState.targetVk = parsed;
+    gState.doubleTapMs = parsedDoubleTapMs;
     gState.hasFirstTap = false;
+    gState.suppressPhysicalUntilUp = false;
+    gState.physicalKeyIsDown = false;
     UpdateStatus();
 }
 
@@ -138,35 +180,53 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
+    if (gState.suppressPhysicalUntilUp) {
+        if (isUp) {
+            gState.suppressPhysicalUntilUp = false;
+            gState.physicalKeyIsDown = false;
+            return 1;
+        }
+
+        if (isDown) {
+            return 1;
+        }
+    }
+
     if (gState.keyLatched) {
         if (isDown) {
             SendVirtualKey(gState.targetVk, false);
             StopRepeatTimer();
             gState.keyLatched = false;
-            gState.ignoreNextPhysicalUp = true;
+            gState.suppressPhysicalUntilUp = true;
+            gState.physicalKeyIsDown = true;
             gState.hasFirstTap = false;
             UpdateStatus();
-            return 1;
-        }
-
-        if (isUp && gState.ignoreNextPhysicalUp) {
-            gState.ignoreNextPhysicalUp = false;
             return 1;
         }
 
         return CallNextHookEx(nullptr, code, wParam, lParam);
     }
 
+    if (isUp) {
+        gState.physicalKeyIsDown = false;
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
     if (isDown) {
+        if (gState.physicalKeyIsDown) {
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+
+        gState.physicalKeyIsDown = true;
         auto now = std::chrono::steady_clock::now();
         if (gState.hasFirstTap) {
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - gState.lastPhysicalDown).count();
-            if (elapsedMs <= kDoubleTapMs) {
+            if (elapsedMs <= gState.doubleTapMs) {
                 SendVirtualKey(gState.targetVk, true);
                 StartRepeatTimer();
                 gState.keyLatched = true;
-                gState.ignoreNextPhysicalUp = true;
                 gState.hasFirstTap = false;
+                gState.suppressPhysicalUntilUp = true;
                 UpdateStatus();
                 return 1;
             }
@@ -209,7 +269,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             gState.keyEdit = CreateWindowW(L"EDIT",
                                            L"T",
                                            WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                                           230,
+                                           210,
                                            18,
                                            50,
                                            24,
@@ -221,7 +281,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"BUTTON",
                           L"Apply",
                           WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-                          290,
+                          270,
                           18,
                           70,
                           24,
@@ -230,11 +290,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           gState.instance,
                           nullptr);
 
+            CreateWindowW(L"STATIC",
+                          L"Double-tap window (ms):",
+                          WS_VISIBLE | WS_CHILD,
+                          20,
+                          52,
+                          180,
+                          20,
+                          hwnd,
+                          reinterpret_cast<HMENU>(IDC_DOUBLE_TAP_LABEL),
+                          gState.instance,
+                          nullptr);
+
+            gState.doubleTapEdit = CreateWindowW(L"EDIT",
+                                                 L"300",
+                                                 WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+                                                 210,
+                                                 50,
+                                                 80,
+                                                 24,
+                                                 hwnd,
+                                                 reinterpret_cast<HMENU>(IDC_DOUBLE_TAP_EDIT),
+                                                 gState.instance,
+                                                 nullptr);
+
             gState.statusLabel = CreateWindowW(L"STATIC",
                                                L"",
                                                WS_VISIBLE | WS_CHILD,
                                                20,
-                                               60,
+                                               84,
                                                420,
                                                20,
                                                hwnd,
@@ -246,7 +330,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                           L"Behavior: double tap configured key to latch and auto-repeat; tap/hold once to release.",
                           WS_VISIBLE | WS_CHILD,
                           20,
-                          90,
+                          112,
                           430,
                           40,
                           hwnd,
@@ -310,7 +394,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                                     CW_USEDEFAULT,
                                     CW_USEDEFAULT,
                                     480,
-                                    180,
+                                    220,
                                     nullptr,
                                     nullptr,
                                     hInstance,
