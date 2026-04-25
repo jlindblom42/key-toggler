@@ -326,7 +326,9 @@ HICON CreateKtIcon(int sizePx) {
     SetBkMode(memDc, TRANSPARENT);
     SetTextColor(memDc, RGB(244, 244, 245));
 
-    const int fontHeight = -MulDiv(std::max(9, sizePx * 10 / 16), GetDeviceCaps(memDc, LOGPIXELSY), 72);
+    const int scaledPointSize = (sizePx * 10) / 16;
+    const int clampedPointSize = scaledPointSize < 9 ? 9 : scaledPointSize;
+    const int fontHeight = -MulDiv(clampedPointSize, GetDeviceCaps(memDc, LOGPIXELSY), 72);
     HFONT textFont = CreateFontW(fontHeight,
                                  0,
                                  0,
